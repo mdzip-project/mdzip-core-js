@@ -2,7 +2,7 @@
   "name": "mdz-core-js",
   "version": "0.1.0",
   "description": "Core TypeScript/JavaScript library for MarkdownZip (.mdz): pack, unpack, validate, and resolve entry points.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
