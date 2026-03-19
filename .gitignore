@@ -1,3 +1,4 @@
 node_modules/
 dist/
 *.tsbuildinfo
+How to Publish to NPM.md
