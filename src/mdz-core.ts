@@ -1,8 +1,10 @@
 import JSZip from 'jszip';
 
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
+const PRODUCER_SPEC_VERSION = '1.0.1-draft';
 
 export type MdzCoreArchiveBinary = Blob | ArrayBuffer | Uint8Array;
+export type MdzArchiveMutationInput = File | Blob | ArrayBuffer | Uint8Array | string;
 
 interface ZipEntry {
   name: string;
@@ -14,12 +16,18 @@ interface ZipLike {
   files: Record<string, ZipEntry>;
 }
 
+interface MutableZipLike extends ZipLike {
+  file(path: string, data: string | ArrayBuffer | Uint8Array): void;
+  remove(path: string): void;
+  generateAsync(options: { type: 'blob'; compression: 'DEFLATE'; compressionOptions: { level: number } }): Promise<Blob>;
+}
+
 interface ZipFactoryLike {
   loadAsync(data: MdzCoreArchiveBinary): Promise<ZipLike>;
 }
 
 interface ZipWriterLike {
-  file(path: string, data: string | ArrayBuffer): void;
+  file(path: string, data: string | ArrayBuffer | Uint8Array): void;
   generateAsync(options: { type: 'blob'; compression: 'DEFLATE'; compressionOptions: { level: number } }): Promise<Blob>;
 }
 
@@ -28,7 +36,36 @@ interface ZipWriterFactoryLike {
 }
 
 export interface MdzManifestAuthor {
-  name: string;
+  name?: string;
+  email?: string;
+  url?: string;
+}
+
+export interface MdzManifestBy {
+  name?: string;
+  email?: string;
+  url?: string;
+}
+
+export interface MdzManifestTimestampObject {
+  when: string;
+  by?: MdzManifestBy;
+}
+
+export interface MdzManifestSpec {
+  name?: string;
+  version?: string;
+}
+
+export interface MdzManifestProducerNode {
+  name?: string;
+  version?: string;
+  url?: string;
+}
+
+export interface MdzManifestProducer {
+  application?: MdzManifestProducerNode;
+  core?: MdzManifestProducerNode;
 }
 
 export interface MdzManifestFileMapEntry {
@@ -38,13 +75,21 @@ export interface MdzManifestFileMapEntry {
 }
 
 export interface MdzManifest {
-  mdz: string;
-  title: string;
+  mdz?: string;
+  spec?: MdzManifestSpec;
+  producer?: MdzManifestProducer;
+  author?: MdzManifestAuthor;
+  title?: string;
   entryPoint?: string | null;
   language?: string | null;
   authors?: MdzManifestAuthor[] | null;
   description?: string | null;
   version?: string | null;
+  created?: string | MdzManifestTimestampObject;
+  modified?: string | MdzManifestTimestampObject;
+  license?: string;
+  keywords?: string[];
+  cover?: string;
   files?: MdzManifestFileMapEntry[];
 }
 
@@ -89,6 +134,19 @@ export interface MdzPackBuildResult {
   warnings: MdzPackWarnings;
 }
 
+export interface MdzValidationResult {
+  isValid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface MdzArchiveMutationResult {
+  blob: Blob;
+  manifest: MdzManifest | null;
+  resolvedEntryPoint: string | null;
+  archivePaths: string[];
+}
+
 export const MDZ_IMAGE_MIME_TYPES: Record<string, string> = {
   png: 'image/png',
   jpg: 'image/jpeg',
@@ -113,6 +171,91 @@ export class MdzArchiveCore {
     const factory = zipFactory ?? MdzArchiveCore.getDefaultZipFactory();
     const zip = await factory.loadAsync(input);
     return new MdzArchiveCore(zip);
+  }
+
+  public static async validate(input: MdzCoreArchiveBinary, zipFactory?: ZipFactoryLike): Promise<MdzValidationResult> {
+    const archive = await MdzArchiveCore.open(input, zipFactory);
+    return archive.validate();
+  }
+
+  public static async addFile(
+    input: MdzCoreArchiveBinary,
+    archiveEntryPath: string,
+    content: MdzArchiveMutationInput
+  ): Promise<MdzArchiveMutationResult> {
+    const targetPath = MdzPackagerCore.normalizePath(archiveEntryPath);
+    const pathError = MdzArchiveCore.validateArchivePath(targetPath);
+    if (pathError) {
+      throw new Error(`ERR_PATH_INVALID: ${pathError}`);
+    }
+
+    const zip = await JSZip.loadAsync(input as unknown as Parameters<typeof JSZip.loadAsync>[0]) as unknown as MutableZipLike;
+    const targetLower = targetPath.toLowerCase();
+    const archivePaths = MdzArchiveCore.getArchivePaths(zip);
+    const nextArchivePaths = archivePaths.filter((p) => p.toLowerCase() !== targetLower);
+    nextArchivePaths.push(targetPath);
+
+    if (targetLower === 'manifest.json') {
+      const replacement = await MdzArchiveCore.parseManifestObjectContent(content, true);
+      const preparedManifest = MdzArchiveCore.stampManifestObject(replacement, true);
+      MdzArchiveCore.validateManifest(preparedManifest);
+      MdzArchiveCore.ensureCreatableEntryPoint(nextArchivePaths, preparedManifest);
+
+      MdzArchiveCore.removeEntryIgnoreCase(zip, targetPath);
+      zip.file('manifest.json', MdzArchiveCore.normaliseLf(JSON.stringify(preparedManifest, null, 2)));
+      return MdzArchiveCore.finalizeMutation(zip);
+    }
+
+    const existingManifestObject = await MdzArchiveCore.readExistingManifestObject(zip, true);
+    if (existingManifestObject) {
+      MdzArchiveCore.validateManifest(existingManifestObject);
+    }
+    MdzArchiveCore.ensureCreatableEntryPoint(nextArchivePaths, existingManifestObject as MdzManifest | null);
+
+    MdzArchiveCore.removeEntryIgnoreCase(zip, targetPath);
+    await MdzArchiveCore.writeZipEntry(zip, targetPath, content);
+
+    if (existingManifestObject) {
+      const refreshed = MdzArchiveCore.stampManifestObject(existingManifestObject, false);
+      MdzArchiveCore.removeEntryIgnoreCase(zip, 'manifest.json');
+      zip.file('manifest.json', MdzArchiveCore.normaliseLf(JSON.stringify(refreshed, null, 2)));
+    }
+
+    return MdzArchiveCore.finalizeMutation(zip);
+  }
+
+  public static async removeFile(input: MdzCoreArchiveBinary, archiveEntryPath: string): Promise<MdzArchiveMutationResult> {
+    const targetPath = MdzPackagerCore.normalizePath(archiveEntryPath);
+    const pathError = MdzArchiveCore.validateArchivePath(targetPath);
+    if (pathError) {
+      throw new Error(`ERR_PATH_INVALID: ${pathError}`);
+    }
+
+    const zip = await JSZip.loadAsync(input as unknown as Parameters<typeof JSZip.loadAsync>[0]) as unknown as MutableZipLike;
+    const targetLower = targetPath.toLowerCase();
+    const archivePaths = MdzArchiveCore.getArchivePaths(zip);
+    const exists = archivePaths.some((p) => p.toLowerCase() === targetLower);
+    if (!exists) {
+      throw new Error(`ERR_NOT_FOUND: Entry "${targetPath}" was not found in archive.`);
+    }
+
+    const nextArchivePaths = archivePaths.filter((p) => p.toLowerCase() !== targetLower);
+    const existingManifestObject = targetLower === 'manifest.json' ? null : await MdzArchiveCore.readExistingManifestObject(zip, true);
+
+    if (existingManifestObject) {
+      MdzArchiveCore.validateManifest(existingManifestObject);
+    }
+    MdzArchiveCore.ensureCreatableEntryPoint(nextArchivePaths, existingManifestObject as MdzManifest | null);
+
+    MdzArchiveCore.removeEntryIgnoreCase(zip, targetPath);
+
+    if (existingManifestObject) {
+      const refreshed = MdzArchiveCore.stampManifestObject(existingManifestObject, false);
+      MdzArchiveCore.removeEntryIgnoreCase(zip, 'manifest.json');
+      zip.file('manifest.json', MdzArchiveCore.normaliseLf(JSON.stringify(refreshed, null, 2)));
+    }
+
+    return MdzArchiveCore.finalizeMutation(zip);
   }
 
   private static getDefaultZipFactory(): ZipFactoryLike {
@@ -206,22 +349,127 @@ export class MdzArchiveCore {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
       throw new Error('ERR_MANIFEST_INVALID: manifest.json must be a JSON object.');
     }
-    const candidate = manifest as Partial<MdzManifest>;
-    if (typeof candidate.mdz !== 'string' || !MdzArchiveCore.SEMVER_RE.test(candidate.mdz)) {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json must include a valid semver "mdz" field.');
-    }
+
+    const candidate = manifest as MdzManifest;
+
+    const validateMetadataNode = (value: unknown, path: string): void => {
+      if (value == null) return;
+      if (typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}" must be an object when provided.`);
+      }
+      const node = value as Record<string, unknown>;
+      for (const key of ['name', 'version', 'url']) {
+        const v = node[key];
+        if (v != null && typeof v !== 'string') {
+          throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}.${key}" must be a string when provided.`);
+        }
+      }
+    };
+
+    const validateByNode = (value: unknown, path: string): void => {
+      if (value == null) return;
+      if (typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}" must be an object when provided.`);
+      }
+      const node = value as Record<string, unknown>;
+      for (const key of ['name', 'email', 'url']) {
+        const v = node[key];
+        if (v != null && typeof v !== 'string') {
+          throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}.${key}" must be a string when provided.`);
+        }
+      }
+    };
+
+    const validateTimestamp = (value: unknown, path: string): void => {
+      if (value == null) return;
+      if (typeof value === 'string') return;
+      if (typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}" must be a string or object when provided.`);
+      }
+      const node = value as Record<string, unknown>;
+      if (typeof node.when !== 'string' || node.when.trim() === '') {
+        throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}.when" must be a non-empty string when "${path}" is an object.`);
+      }
+      validateByNode(node.by, `${path}.by`);
+    };
+
     if (candidate.title != null && (typeof candidate.title !== 'string' || candidate.title.trim() === '')) {
       throw new Error('ERR_MANIFEST_INVALID: manifest.json "title" must be a non-empty string when provided.');
     }
-
-    const major = Number.parseInt(candidate.mdz.split('.')[0] ?? '0', 10);
-    if (major > MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
-      throw new Error(`ERR_VERSION_UNSUPPORTED: manifest.json targets mdz ${candidate.mdz}, but this viewer supports major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.x only.`);
+    if (candidate.description != null && typeof candidate.description !== 'string') {
+      throw new Error('ERR_MANIFEST_INVALID: manifest.json "description" must be a string when provided.');
+    }
+    if (candidate.version != null && typeof candidate.version !== 'string') {
+      throw new Error('ERR_MANIFEST_INVALID: manifest.json "version" must be a string when provided.');
+    }
+    if (candidate.language != null && typeof candidate.language !== 'string') {
+      throw new Error('ERR_MANIFEST_INVALID: manifest.json "language" must be a string when provided.');
+    }
+    if (candidate.license != null && typeof candidate.license !== 'string') {
+      throw new Error('ERR_MANIFEST_INVALID: manifest.json "license" must be a string when provided.');
+    }
+    if (candidate.keywords != null) {
+      if (!Array.isArray(candidate.keywords) || candidate.keywords.some((k) => typeof k !== 'string')) {
+        throw new Error('ERR_MANIFEST_INVALID: manifest.json "keywords" must be an array of strings when provided.');
+      }
+    }
+    if (candidate.cover != null && typeof candidate.cover !== 'string') {
+      throw new Error('ERR_MANIFEST_INVALID: manifest.json "cover" must be a string when provided.');
     }
 
     if (candidate.entryPoint != null && typeof candidate.entryPoint !== 'string') {
       throw new Error('ERR_MANIFEST_INVALID: manifest.json "entryPoint" must be a string when provided.');
     }
+    if (candidate.entryPoint != null && MdzArchiveCore.validateArchivePath(candidate.entryPoint) != null) {
+      throw new Error('ERR_MANIFEST_INVALID: manifest.json "entryPoint" must be a valid archive-relative path.');
+    }
+
+    if (candidate.spec != null) {
+      if (typeof candidate.spec !== 'object' || Array.isArray(candidate.spec)) {
+        throw new Error('ERR_MANIFEST_INVALID: manifest.json "spec" must be an object when provided.');
+      }
+      const spec = candidate.spec as Record<string, unknown>;
+      if (spec.name != null && typeof spec.name !== 'string') {
+        throw new Error('ERR_MANIFEST_INVALID: manifest.json "spec.name" must be a string when provided.');
+      }
+      if (spec.version != null) {
+        if (typeof spec.version !== 'string' || !MdzArchiveCore.SEMVER_RE.test(spec.version)) {
+          throw new Error('ERR_MANIFEST_INVALID: manifest.json "spec.version" must be a valid semver string when provided.');
+        }
+        const specMajor = Number.parseInt(spec.version.split('.')[0] ?? '0', 10);
+        if (specMajor > MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
+          throw new Error(
+            `ERR_VERSION_UNSUPPORTED: manifest.json spec.version ${spec.version} is not supported; this viewer supports major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.x only.`
+          );
+        }
+      }
+    }
+
+    if (candidate.mdz != null) {
+      if (typeof candidate.mdz !== 'string' || !MdzArchiveCore.SEMVER_RE.test(candidate.mdz)) {
+        throw new Error('ERR_MANIFEST_INVALID: manifest.json "mdz" must be a valid semver string when provided.');
+      }
+      const major = Number.parseInt(candidate.mdz.split('.')[0] ?? '0', 10);
+      if (major > MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
+        throw new Error(`ERR_VERSION_UNSUPPORTED: manifest.json targets mdz ${candidate.mdz}, but this viewer supports major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.x only.`);
+      }
+    }
+
+    if (candidate.producer != null) {
+      if (typeof candidate.producer !== 'object' || Array.isArray(candidate.producer)) {
+        throw new Error('ERR_MANIFEST_INVALID: manifest.json "producer" must be an object when provided.');
+      }
+      const producer = candidate.producer as Record<string, unknown>;
+      validateMetadataNode(producer.application, 'producer.application');
+      validateMetadataNode(producer.core, 'producer.core');
+    }
+
+    if (candidate.author != null) {
+      validateByNode(candidate.author, 'author');
+    }
+
+    validateTimestamp(candidate.created, 'created');
+    validateTimestamp(candidate.modified, 'modified');
   }
 
   public async readManifest(): Promise<MdzManifest | null> {
@@ -244,15 +492,103 @@ export class MdzArchiveCore {
     }
 
     MdzArchiveCore.validateManifest(manifest);
-    MdzArchiveCore.manifestCache.set(this.zip, manifest);
-    return manifest;
+
+    const normalized = { ...(manifest as MdzManifest) };
+    if (normalized.cover) {
+      const coverPath = MdzArchiveCore.normalizePath(normalized.cover);
+      const coverPathError = MdzArchiveCore.validateArchivePath(coverPath);
+      const coverEntry = Object.entries(this.zip.files).find(([p]) => MdzArchiveCore.normalizePath(p).toLowerCase() === coverPath.toLowerCase())?.[1];
+      const coverExistsAsFile = !!coverEntry && !coverEntry.dir;
+      if (coverPathError || !coverExistsAsFile) {
+        delete normalized.cover;
+      }
+    }
+
+    MdzArchiveCore.manifestCache.set(this.zip, normalized);
+    return normalized;
+  }
+
+  public async validate(): Promise<MdzValidationResult> {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    const archivePaths = MdzArchiveCore.getArchivePaths(this.zip);
+
+    for (const path of archivePaths) {
+      const pathError = MdzArchiveCore.validateArchivePath(path);
+      if (pathError) errors.push(`ERR_PATH_INVALID: ${pathError}`);
+    }
+
+    let manifest: MdzManifest | null = null;
+    let manifestReadFailed = false;
+    const manifestEntry = this.findEntry('manifest.json');
+    if (manifestEntry) {
+      let rawManifest: Record<string, unknown> | null = null;
+      try {
+        const rawText = await manifestEntry.async('text');
+        const parsed = JSON.parse(String(rawText));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          rawManifest = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // readManifest() will report JSON parse errors as ERR_MANIFEST_INVALID
+      }
+
+      try {
+        manifest = await this.readManifest();
+      } catch (error) {
+        manifestReadFailed = true;
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+
+      if (manifest) {
+        const specVersion = manifest.spec?.version;
+        if (!specVersion || specVersion.trim() === '') {
+          warnings.push("manifest 'spec.version' is missing; version metadata is unavailable.");
+        } else if (MdzArchiveCore.SEMVER_RE.test(specVersion)) {
+          const major = Number.parseInt(specVersion.split('.')[0] ?? '0', 10);
+          if (major < MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
+            warnings.push(
+              `manifest 'spec.version' major version ${major} is older than supported major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.`
+            );
+          }
+        }
+
+        if (manifest.entryPoint && !archivePaths.some((p) => p.toLowerCase() === manifest!.entryPoint!.toLowerCase())) {
+          errors.push(`ERR_ENTRYPOINT_MISSING: manifest 'entryPoint' references '${manifest.entryPoint}' which does not exist in the archive.`);
+        }
+
+        const coverCandidate = typeof rawManifest?.cover === 'string' ? rawManifest.cover : manifest.cover;
+        if (coverCandidate) {
+          const cover = MdzArchiveCore.normalizePath(coverCandidate);
+          const coverEntry = this.findEntry(cover);
+          if (!coverEntry || coverEntry.dir) {
+            warnings.push(`manifest 'cover' references '${coverCandidate}' which does not exist in the archive.`);
+          }
+        }
+      }
+    } else {
+      warnings.push('No manifest.json present. Version metadata is unavailable.');
+    }
+
+    if (!manifestReadFailed) {
+      try {
+        await this.resolveEntryPoint();
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    return {
+      isValid: errors.length === 0,
+      errors,
+      warnings
+    };
   }
 
   public async resolveEntryPoint(): Promise<string> {
     const manifest = await this.readManifest();
-    const archivePaths = Object.keys(this.zip.files)
-      .filter((p) => !this.zip.files[p]?.dir)
-      .map((p) => MdzArchiveCore.normalizePath(p));
+    const archivePaths = MdzArchiveCore.getArchivePaths(this.zip);
 
     if (manifest?.entryPoint && !archivePaths.some((p) => p.toLowerCase() === manifest.entryPoint!.toLowerCase())) {
       throw new Error(`ERR_ENTRYPOINT_MISSING: manifest.json references "${manifest.entryPoint}" which is not in the archive`);
@@ -267,6 +603,154 @@ export class MdzArchiveCore {
       throw new Error('ERR_ENTRYPOINT_UNRESOLVED: Multiple Markdown files at the archive root and no manifest.json entryPoint. Add an index.md or manifest.json entryPoint.');
     }
     throw new Error('ERR_ENTRYPOINT_UNRESOLVED: No Markdown file found at the archive root.');
+  }
+
+  private static getArchivePaths(zip: ZipLike): string[] {
+    return Object.keys(zip.files)
+      .filter((p) => !zip.files[p]?.dir)
+      .map((p) => MdzArchiveCore.normalizePath(p));
+  }
+
+  private static removeEntryIgnoreCase(zip: MutableZipLike, targetPath: string): void {
+    const targetLower = targetPath.toLowerCase();
+    for (const path of Object.keys(zip.files)) {
+      if (MdzArchiveCore.normalizePath(path).toLowerCase() === targetLower) {
+        zip.remove(path);
+      }
+    }
+  }
+
+  private static isTextFile(path: string): boolean {
+    return /\.(md|markdown|json|txt|css|html|htm|xml|svg|yaml|yml|toml)$/i.test(path);
+  }
+
+  private static normaliseLf(content: string): string {
+    return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  }
+
+  private static async readExistingManifestObject(zip: ZipLike, requireValid: boolean): Promise<Record<string, unknown> | null> {
+    const manifestEntry = Object.entries(zip.files).find(([p, entry]) => MdzArchiveCore.normalizePath(p).toLowerCase() === 'manifest.json' && !entry.dir)?.[1];
+    if (!manifestEntry) return null;
+
+    const raw = await manifestEntry.async('text');
+    try {
+      const parsed = JSON.parse(String(raw));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        if (requireValid) throw new Error('ERR_MANIFEST_INVALID: Existing manifest.json is invalid: expected a JSON object.');
+        return null;
+      }
+      return parsed as Record<string, unknown>;
+    } catch (error) {
+      if (requireValid) {
+        if (error instanceof Error && /expected a JSON object/.test(error.message)) throw error;
+        throw new Error('ERR_MANIFEST_INVALID: Existing manifest.json is invalid JSON.');
+      }
+      return null;
+    }
+  }
+
+  private static async parseManifestObjectContent(content: MdzArchiveMutationInput, requireValid: boolean): Promise<Record<string, unknown>> {
+    const raw = await MdzArchiveCore.readMutationInputAsText(content);
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        if (requireValid) throw new Error('ERR_MANIFEST_INVALID: Replacement manifest.json is invalid: expected a JSON object.');
+        return {};
+      }
+      return parsed as Record<string, unknown>;
+    } catch (error) {
+      if (requireValid) {
+        if (error instanceof Error && /expected a JSON object/.test(error.message)) throw error;
+        throw new Error('ERR_MANIFEST_INVALID: Replacement manifest.json is invalid JSON.');
+      }
+      return {};
+    }
+  }
+
+  private static ensureManifestSpecObject(manifest: Record<string, unknown>): void {
+    let spec = manifest.spec;
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+      spec = {};
+      manifest.spec = spec;
+    }
+    const specObj = spec as Record<string, unknown>;
+    if (typeof specObj.name !== 'string' || !specObj.name.trim()) {
+      specObj.name = 'markdownzip-spec';
+    }
+    if (typeof specObj.version !== 'string' || !specObj.version.trim()) {
+      specObj.version = PRODUCER_SPEC_VERSION;
+    }
+  }
+
+  private static stampManifestObject(manifest: Record<string, unknown>, setCreatedIfMissing: boolean): Record<string, unknown> {
+    const now = new Date().toISOString();
+    const next = { ...manifest };
+    MdzArchiveCore.ensureManifestSpecObject(next);
+    if (setCreatedIfMissing && next.created == null) {
+      next.created = now;
+    }
+    const modified = next.modified;
+    if (modified && typeof modified === 'object' && !Array.isArray(modified)) {
+      next.modified = { ...(modified as Record<string, unknown>), when: now };
+    } else {
+      next.modified = now;
+    }
+    return next;
+  }
+
+  private static ensureCreatableEntryPoint(archivePaths: string[], manifest?: Pick<MdzManifest, 'entryPoint'> | null): void {
+    if (manifest?.entryPoint && !archivePaths.some((p) => p.toLowerCase() === manifest.entryPoint!.toLowerCase())) {
+      throw new Error(`ERR_ENTRYPOINT_MISSING: manifest 'entryPoint' references '${manifest.entryPoint}' which does not exist in the archive.`);
+    }
+
+    const resolved = MdzPackagerCore.resolveEntryPoint(archivePaths, manifest);
+    if (!resolved) {
+      throw new Error(
+        'ERR_ENTRYPOINT_UNRESOLVED: No unambiguous entry point could be determined. Add index.md at the archive root, keep exactly one root Markdown file, or set manifest.entryPoint.'
+      );
+    }
+  }
+
+  private static async readMutationInputAsText(content: MdzArchiveMutationInput): Promise<string> {
+    if (typeof content === 'string') return content;
+    if (content instanceof Blob) return content.text();
+    return new TextDecoder().decode(content);
+  }
+
+  private static async readMutationInputAsBinary(content: MdzArchiveMutationInput): Promise<ArrayBuffer | Uint8Array> {
+    if (typeof content === 'string') return new TextEncoder().encode(content);
+    if (content instanceof Blob) return content.arrayBuffer();
+    if (content instanceof Uint8Array) return content;
+    return content;
+  }
+
+  private static async writeZipEntry(zip: MutableZipLike, path: string, content: MdzArchiveMutationInput): Promise<void> {
+    if (MdzArchiveCore.isTextFile(path)) {
+      const text = await MdzArchiveCore.readMutationInputAsText(content);
+      zip.file(path, MdzArchiveCore.normaliseLf(text));
+      return;
+    }
+    const binary = await MdzArchiveCore.readMutationInputAsBinary(content);
+    zip.file(path, binary);
+  }
+
+  private static async finalizeMutation(zip: MutableZipLike): Promise<MdzArchiveMutationResult> {
+    const bytes = await (zip as unknown as JSZip).generateAsync({
+      type: 'uint8array',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 }
+    });
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    const blob = new Blob([buffer], { type: 'application/zip' });
+    const archive = await MdzArchiveCore.open(buffer);
+    const manifest = await archive.readManifest();
+    const resolvedEntryPoint = await archive.resolveEntryPoint().catch(() => null);
+    return {
+      blob,
+      manifest,
+      resolvedEntryPoint,
+      archivePaths: MdzArchiveCore.getArchivePaths(zip)
+    };
   }
 }
 
@@ -405,14 +889,27 @@ export class MdzPackagerCore {
 
     if (!hasManifestOption) return null;
 
+    const now = new Date().toISOString();
+
     return {
-      mdz: '1.0.0',
+      spec: {
+        name: 'markdownzip-spec',
+        version: PRODUCER_SPEC_VERSION
+      },
+      producer: {
+        core: {
+          name: 'mdz-core-js'
+        }
+      },
       title: options.title || rootName,
       entryPoint: options.entryPoint || null,
       language: options.language || 'en',
+      author: options.author ? { name: options.author } : undefined,
       authors: options.author ? [{ name: options.author }] : null,
       description: options.description || null,
-      version: options.docVersion || null
+      version: options.docVersion || null,
+      created: now,
+      modified: now
     };
   }
 
@@ -575,4 +1072,3 @@ export class MdzPackagerCore {
     };
   }
 }
-
