@@ -1,10 +1,10 @@
-# mdz-core-js
+# mdzip-core-js
 
-Core TypeScript/JavaScript library for MarkdownZip (`.mdz`) archives.
+Core TypeScript/JavaScript library for MDZip (`.mdz`) archives.
 
 Current scope (core only):
 - open/unpack archive data
-- manifest validation (MarkdownZip spec `1.0.1-draft` aligned)
+- manifest validation (MDZip spec `1.0.1-draft` aligned)
 - entry-point resolution
 - archive conformance validation (`errors` + `warnings`)
 - archive mutation helpers (`addFile`, `removeFile`) with entry-point safety
@@ -14,13 +14,13 @@ Current scope (core only):
 ## Install
 
 ```bash
-npm install mdz-core-js
+npm install mdzip-core-js
 ```
 
 ## Usage
 
 ```ts
-import { MdzArchiveCore } from 'mdz-core-js';
+import { MdzArchiveCore } from 'mdzip-core-js';
 
 const archive = await MdzArchiveCore.open(fileOrArrayBuffer);
 const entryPoint = await archive.resolveEntryPoint();

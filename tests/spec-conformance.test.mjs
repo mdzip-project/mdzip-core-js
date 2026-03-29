@@ -124,7 +124,7 @@ test('manifest without spec.version remains readable', async () => {
 test('manifest with unsupported spec.version major is rejected', async () => {
   const zip = new JSZip();
   zip.file('index.md', '# hello\n');
-  zip.file('manifest.json', JSON.stringify({ spec: { name: 'markdownzip-spec', version: '2.0.0' } }));
+  zip.file('manifest.json', JSON.stringify({ spec: { name: 'mdzip-spec', version: '2.0.0' } }));
 
   const raw = await zip.generateAsync({ type: 'uint8array' });
   const archive = await MdzArchiveCore.open(raw);
@@ -204,7 +204,7 @@ test('generated producer manifest includes spec.version', () => {
 
   assert.ok(manifest);
   assert.equal(manifest.spec.version, '1.0.1-draft');
-  assert.equal(manifest.spec.name, 'markdownzip-spec');
+  assert.equal(manifest.spec.name, 'mdzip-spec');
   assert.equal(typeof manifest.created, 'string');
   assert.equal(typeof manifest.modified, 'string');
 });

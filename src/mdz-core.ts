@@ -3,7 +3,15 @@ import JSZip from 'jszip';
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.0.1-draft';
 
+/**
+ * Binary input accepted for opening an existing `.mdz` archive.
+ */
 export type MdzCoreArchiveBinary = Blob | ArrayBuffer | Uint8Array;
+/**
+ * Content input accepted when mutating archive entries.
+ *
+ * String values are written as UTF-8 text; binary values are written as raw bytes.
+ */
 export type MdzArchiveMutationInput = File | Blob | ArrayBuffer | Uint8Array | string;
 
 interface ZipEntry {
@@ -35,118 +43,235 @@ interface ZipWriterFactoryLike {
   create(): ZipWriterLike;
 }
 
+/**
+ * Author/contact metadata used by manifest fields.
+ */
 export interface MdzManifestAuthor {
+  /** Human-readable display name. */
   name?: string;
+  /** Optional contact email address. */
   email?: string;
+  /** Optional author profile/home URL. */
   url?: string;
 }
 
+/**
+ * Identity metadata used by timestamp `by` blocks.
+ */
 export interface MdzManifestBy {
+  /** Display name for creator/modifier attribution. */
   name?: string;
+  /** Optional contact email address. */
   email?: string;
+  /** Optional profile/home URL. */
   url?: string;
 }
 
+/**
+ * Object-form timestamp metadata used by draft 1.0.x manifests.
+ */
 export interface MdzManifestTimestampObject {
+  /** ISO-8601 timestamp value. */
   when: string;
+  /** Optional identity metadata for who performed the action. */
   by?: MdzManifestBy;
 }
 
+/**
+ * Specification compatibility metadata for the archive manifest.
+ */
 export interface MdzManifestSpec {
+  /** Spec identifier (for example `mdzip-spec`). */
   name?: string;
+  /** Target spec version string (semver). */
   version?: string;
 }
 
+/**
+ * Producer metadata node describing an app/core identity.
+ */
 export interface MdzManifestProducerNode {
+  /** Producer display name. */
   name?: string;
+  /** Producer version string. */
   version?: string;
+  /** Producer homepage/repository URL. */
   url?: string;
 }
 
+/**
+ * Producer metadata grouping for application and reusable core.
+ */
 export interface MdzManifestProducer {
+  /** Top-level application/tool metadata. */
   application?: MdzManifestProducerNode;
+  /** Reusable core/runtime metadata used by the producer app. */
   core?: MdzManifestProducerNode;
 }
 
+/**
+ * Optional file-map entry used when source files are remapped during packaging.
+ */
 export interface MdzManifestFileMapEntry {
+  /** Final archive-relative path after normalization/sanitization. */
   path: string;
+  /** Original source-relative path before remapping. */
   originalPath: string;
+  /** Human-friendly title derived from file name/source. */
   title: string;
 }
 
+/**
+ * Parsed shape of `manifest.json` as supported by this library.
+ *
+ * Includes current fields plus legacy draft compatibility fields.
+ */
 export interface MdzManifest {
+  /** Legacy pre-`spec.version` manifest version field. */
   mdz?: string;
+  /** Specification compatibility metadata. */
   spec?: MdzManifestSpec;
+  /** Producer provenance metadata. */
   producer?: MdzManifestProducer;
+  /** Primary author attribution metadata. */
   author?: MdzManifestAuthor;
+  /** Human-readable document title. */
   title?: string;
+  /** Primary Markdown entry path, archive-relative. */
   entryPoint?: string | null;
+  /** Natural language tag (for example `en`, `fr-CA`). */
   language?: string | null;
+  /** Legacy plural author field retained for compatibility. */
   authors?: MdzManifestAuthor[] | null;
+  /** Short document summary/description. */
   description?: string | null;
+  /** Document version (not spec version). */
   version?: string | null;
+  /** Creation timestamp (string or draft object form). */
   created?: string | MdzManifestTimestampObject;
+  /** Last-modified timestamp (string or draft object form). */
   modified?: string | MdzManifestTimestampObject;
+  /** SPDX ID or license URL. */
   license?: string;
+  /** Keyword list used for cataloging/search. */
   keywords?: string[];
+  /** Archive-relative cover asset path. */
   cover?: string;
+  /** Optional file-map metadata generated during packing. */
   files?: MdzManifestFileMapEntry[];
 }
 
+/**
+ * Packaging options used by {@link MdzPackagerCore.buildArchive}.
+ */
 export interface MdzPackOptions {
+  /** Generate `index.md` when no unambiguous entry point exists. */
   createIndex: boolean;
+  /** Enable path sanitization and include manifest file-map metadata. */
   mapFiles: boolean;
+  /** Glob filters that determine which input files are included. */
   filters: string[];
+  /** Optional manifest title override. */
   title?: string | null;
+  /** Optional manifest entry point override. */
   entryPoint?: string | null;
+  /** Optional language tag override. */
   language?: string | null;
+  /** Optional single-author display name. */
   author?: string | null;
+  /** Optional manifest description override. */
   description?: string | null;
+  /** Optional document version field value. */
   docVersion?: string | null;
 }
 
+/**
+ * Single source file candidate for packaging.
+ */
 export interface MdzPackInputFile {
+  /** Source-relative path used as the archive path candidate. */
   path: string;
+  /** Browser `File` source for binary/text loading. */
   file?: File;
+  /** Direct text source when not providing `file`. */
   text?: string;
 }
 
+/**
+ * Internal/returned representation of a file selected for archive output.
+ */
 export interface MdzSelectedFile {
+  /** Final archive-relative output path. */
   archivePath: string;
+  /** Original source path before remapping/sanitization. */
   originalPath: string;
+  /** Original `File` input when provided. */
   file?: File;
+  /** In-memory text content when provided/generated. */
   text?: string;
 }
 
+/**
+ * Non-fatal packaging warnings and counters produced during archive build.
+ */
 export interface MdzPackWarnings {
+  /** Count of source paths that failed strict archive path validation. */
   invalidPathCount: number;
+  /** Count of paths that were sanitized and remapped. */
   sanitizedPathCount: number;
+  /** Breakdown of skipped files by reason key. */
   skippedByReason: Record<string, number>;
+  /** True when no entry point could be resolved at build completion. */
   unresolvedEntry: boolean;
 }
 
+/**
+ * Result object returned by archive build operations.
+ */
 export interface MdzPackBuildResult {
+  /** Final archive blob payload. */
   blob: Blob;
+  /** Manifest written to archive, when generated. */
   manifest: MdzManifest | null;
+  /** Resolved primary entry path (or `null`). */
   resolvedEntryPoint: string | null;
+  /** All file paths written into the archive. */
   archivePaths: string[];
+  /** Detailed selection list for included/generated files. */
   selected: MdzSelectedFile[];
+  /** Packaging warnings/counters. */
   warnings: MdzPackWarnings;
 }
 
+/**
+ * Conformance validation summary for an archive.
+ */
 export interface MdzValidationResult {
+  /** True when no validation errors were found. */
   isValid: boolean;
+  /** Fatal/non-conformant issues discovered during validation. */
   errors: string[];
+  /** Non-fatal advisory findings discovered during validation. */
   warnings: string[];
 }
 
+/**
+ * Result object returned by archive mutation operations.
+ */
 export interface MdzArchiveMutationResult {
+  /** New archive blob generated after mutation. */
   blob: Blob;
+  /** Parsed manifest after mutation, when present. */
   manifest: MdzManifest | null;
+  /** Resolved primary entry path after mutation, if any. */
   resolvedEntryPoint: string | null;
+  /** Archive file paths present after mutation. */
   archivePaths: string[];
 }
 
+/**
+ * Extension-to-MIME map for common image assets in MDZip archives.
+ */
 export const MDZ_IMAGE_MIME_TYPES: Record<string, string> = {
   png: 'image/png',
   jpg: 'image/jpeg',
@@ -158,26 +283,58 @@ export const MDZ_IMAGE_MIME_TYPES: Record<string, string> = {
   ico: 'image/x-icon'
 };
 
+/**
+ * Core archive reader/validator/mutator for `.mdz` files.
+ */
 export class MdzArchiveCore {
+  /**
+   * Public image MIME map for consumers.
+   */
   public static readonly IMAGE_MIME_TYPES = MDZ_IMAGE_MIME_TYPES;
   private static readonly SUPPORTED_MDZ_MAJOR = 1;
   private static readonly SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
   private static readonly entriesCache = new WeakMap<ZipLike, Record<string, ZipEntry>>();
   private static readonly manifestCache = new WeakMap<ZipLike, MdzManifest | null>();
 
+  /**
+   * Creates an archive wrapper around a previously loaded ZIP object.
+   *
+   * @param zip - Loaded zip-like structure containing archive entries.
+   */
   public constructor(private readonly zip: ZipLike) {}
 
+  /**
+   * Opens archive binary data and returns a core archive instance.
+   *
+   * @param input - Raw archive bytes.
+   * @param zipFactory - Optional custom zip loader.
+   */
   public static async open(input: MdzCoreArchiveBinary, zipFactory?: ZipFactoryLike): Promise<MdzArchiveCore> {
     const factory = zipFactory ?? MdzArchiveCore.getDefaultZipFactory();
     const zip = await factory.loadAsync(input);
     return new MdzArchiveCore(zip);
   }
 
+  /**
+   * Convenience helper to open and validate an archive in one call.
+   *
+   * @param input - Raw archive bytes.
+   * @param zipFactory - Optional custom zip loader.
+   */
   public static async validate(input: MdzCoreArchiveBinary, zipFactory?: ZipFactoryLike): Promise<MdzValidationResult> {
     const archive = await MdzArchiveCore.open(input, zipFactory);
     return archive.validate();
   }
 
+  /**
+   * Adds or replaces an archive entry and returns a newly generated archive blob.
+   *
+   * Also validates entry-point integrity and refreshes manifest metadata when present.
+   *
+   * @param input - Existing archive bytes.
+   * @param archiveEntryPath - Archive-relative destination path.
+   * @param content - New entry content.
+   */
   public static async addFile(
     input: MdzCoreArchiveBinary,
     archiveEntryPath: string,
@@ -224,6 +381,14 @@ export class MdzArchiveCore {
     return MdzArchiveCore.finalizeMutation(zip);
   }
 
+  /**
+   * Removes an archive entry and returns a newly generated archive blob.
+   *
+   * Also validates entry-point integrity and refreshes manifest metadata when present.
+   *
+   * @param input - Existing archive bytes.
+   * @param archiveEntryPath - Archive-relative path to remove.
+   */
   public static async removeFile(input: MdzCoreArchiveBinary, archiveEntryPath: string): Promise<MdzArchiveMutationResult> {
     const targetPath = MdzPackagerCore.normalizePath(archiveEntryPath);
     const pathError = MdzArchiveCore.validateArchivePath(targetPath);
@@ -267,14 +432,30 @@ export class MdzArchiveCore {
     };
   }
 
+  /**
+   * Normalizes path separators and strips leading slashes.
+   *
+   * @param path - Any input path.
+   */
   public static normalizePath(path: string): string {
     return String(path || '').replace(/\\/g, '/').replace(/^\/+/, '');
   }
 
+  /**
+   * Returns true if the provided path looks like a Markdown document path.
+   *
+   * @param path - Archive-relative path.
+   */
   public static isMarkdownFile(path: string): boolean {
     return /\.(md|markdown)$/i.test(path);
   }
 
+  /**
+   * Validates archive path constraints.
+   *
+   * @param path - Archive-relative path.
+   * @returns `null` when valid, otherwise a short reason string.
+   */
   public static validateArchivePath(path: string): string | null {
     const raw = String(path || '');
     if (!raw) return 'empty path';
@@ -296,6 +477,14 @@ export class MdzArchiveCore {
     return i >= 0 ? filePath.slice(0, i + 1) : '';
   }
 
+  /**
+   * Resolves a relative Markdown link target against an archive base path.
+   *
+   * Query/hash fragments are stripped and traversal beyond archive root is rejected.
+   *
+   * @param base - Referencing file path.
+   * @param relative - Relative target path from markdown/link source.
+   */
   public static resolvePath(base: string, relative: string): string {
     let target = String(relative || '').trim();
     if (target.startsWith('<') && target.endsWith('>')) {
@@ -331,6 +520,11 @@ export class MdzArchiveCore {
     return out.join('/');
   }
 
+  /**
+   * Finds an archive entry by path (case-insensitive fallback).
+   *
+   * @param path - Archive-relative path.
+   */
   public findEntry(path: string): ZipEntry | null {
     const normalized = MdzArchiveCore.normalizePath(path);
     if (this.zip.files[normalized]) return this.zip.files[normalized];
@@ -472,6 +666,11 @@ export class MdzArchiveCore {
     validateTimestamp(candidate.modified, 'modified');
   }
 
+  /**
+   * Parses and validates `manifest.json` if present.
+   *
+   * Missing or invalid cover references are normalized away in returned data.
+   */
   public async readManifest(): Promise<MdzManifest | null> {
     if (MdzArchiveCore.manifestCache.has(this.zip)) {
       return MdzArchiveCore.manifestCache.get(this.zip) ?? null;
@@ -508,6 +707,9 @@ export class MdzArchiveCore {
     return normalized;
   }
 
+  /**
+   * Validates archive conformance and returns errors/warnings.
+   */
   public async validate(): Promise<MdzValidationResult> {
     const errors: string[] = [];
     const warnings: string[] = [];
@@ -586,6 +788,11 @@ export class MdzArchiveCore {
     };
   }
 
+  /**
+   * Resolves the primary markdown entry point for rendering.
+   *
+   * @throws When no unambiguous entry point can be determined.
+   */
   public async resolveEntryPoint(): Promise<string> {
     const manifest = await this.readManifest();
     const archivePaths = MdzArchiveCore.getArchivePaths(this.zip);
@@ -675,7 +882,7 @@ export class MdzArchiveCore {
     }
     const specObj = spec as Record<string, unknown>;
     if (typeof specObj.name !== 'string' || !specObj.name.trim()) {
-      specObj.name = 'markdownzip-spec';
+      specObj.name = 'mdzip-spec';
     }
     if (typeof specObj.version !== 'string' || !specObj.version.trim()) {
       specObj.version = PRODUCER_SPEC_VERSION;
@@ -754,7 +961,13 @@ export class MdzArchiveCore {
   }
 }
 
+/**
+ * Packaging helpers for creating `.mdz` archives from source files.
+ */
 export class MdzPackagerCore {
+  /**
+   * Default include globs for markdown and common image assets.
+   */
   public static readonly DEFAULT_FILTERS = [
     '**/*.md',
     '**/*.markdown',
@@ -767,14 +980,29 @@ export class MdzPackagerCore {
     '**/*.avif'
   ];
 
+  /**
+   * Normalizes input file paths for archive packaging.
+   *
+   * @param path - Source file path.
+   */
   public static normalizePath(path: string): string {
     return MdzArchiveCore.normalizePath(path).replace(/^\.\//, '');
   }
 
+  /**
+   * Validates archive path constraints.
+   *
+   * @param path - Archive-relative path.
+   */
   public static validateArchivePath(path: string): string | null {
     return MdzArchiveCore.validateArchivePath(path);
   }
 
+  /**
+   * Sanitizes one archive path segment by replacing forbidden characters.
+   *
+   * @param segment - Single path segment.
+   */
   public static sanitisePathSegment(segment: string): string {
     let out = '';
     for (const c of segment) {
@@ -788,6 +1016,11 @@ export class MdzPackagerCore {
     return out;
   }
 
+  /**
+   * Sanitizes a full archive path by normalizing each path segment.
+   *
+   * @param path - Candidate archive path.
+   */
   public static sanitiseArchivePath(path: string): string {
     return MdzPackagerCore.normalizePath(path)
       .split('/')
@@ -796,6 +1029,12 @@ export class MdzPackagerCore {
       .join('/');
   }
 
+  /**
+   * Ensures archive path uniqueness by appending `-2`, `-3`, etc when needed.
+   *
+   * @param candidate - Desired archive path.
+   * @param usedPaths - Case-insensitive set of already-used paths.
+   */
   public static makeUniqueArchivePath(candidate: string, usedPaths: Set<string>): string {
     if (!usedPaths.has(candidate.toLowerCase())) {
       usedPaths.add(candidate.toLowerCase());
@@ -820,6 +1059,12 @@ export class MdzPackagerCore {
     }
   }
 
+  /**
+   * Tests whether a path matches a glob pattern supporting `*`, `?`, and `**`.
+   *
+   * @param path - Archive-relative path.
+   * @param pattern - Glob pattern.
+   */
   public static globMatch(path: string, pattern: string): boolean {
     const pathParts = path.split('/').filter(Boolean);
     const patternParts = pattern.replace(/\\/g, '/').split('/').filter(Boolean);
@@ -873,10 +1118,22 @@ export class MdzPackagerCore {
     return matchParts(0, 0);
   }
 
+  /**
+   * Returns true if a path matches at least one filter pattern.
+   *
+   * @param path - Archive-relative path.
+   * @param filters - Glob filter list.
+   */
   public static matchesAnyFilter(path: string, filters: string[]): boolean {
     return filters.some((pattern) => MdzPackagerCore.globMatch(path, pattern));
   }
 
+  /**
+   * Builds a generated manifest from packaging options, or `null` when none is needed.
+   *
+   * @param rootName - Root/source label for fallback title.
+   * @param options - Packaging options.
+   */
   public static buildManifestFromOptions(rootName: string, options: MdzPackOptions): MdzManifest | null {
     const hasManifestOption =
       options.mapFiles
@@ -893,12 +1150,12 @@ export class MdzPackagerCore {
 
     return {
       spec: {
-        name: 'markdownzip-spec',
+        name: 'mdzip-spec',
         version: PRODUCER_SPEC_VERSION
       },
       producer: {
         core: {
-          name: 'mdz-core-js'
+          name: 'mdzip-core-js'
         }
       },
       title: options.title || rootName,
@@ -913,6 +1170,12 @@ export class MdzPackagerCore {
     };
   }
 
+  /**
+   * Resolves entry point using manifest override, `index.md`, or single-root-markdown fallback.
+   *
+   * @param archivePaths - Archive file paths.
+   * @param manifest - Optional manifest with `entryPoint`.
+   */
   public static resolveEntryPoint(archivePaths: string[], manifest?: Pick<MdzManifest, 'entryPoint'> | null): string | null {
     if (manifest?.entryPoint && archivePaths.some((p) => p.toLowerCase() === manifest.entryPoint!.toLowerCase())) {
       return manifest.entryPoint;
@@ -923,6 +1186,12 @@ export class MdzPackagerCore {
     return rootMarkdown.length === 1 ? (rootMarkdown[0] ?? null) : null;
   }
 
+  /**
+   * Generates a simple index markdown page for archives without a clear entry point.
+   *
+   * @param markdownPaths - Markdown files to list.
+   * @param title - Optional heading title.
+   */
   public static buildGeneratedIndex(markdownPaths: string[], title?: string | null): string {
     const pageTitle = title && title.trim() ? title.trim() : 'Index';
     const lines = [`# ${pageTitle}`, ''];
@@ -943,6 +1212,22 @@ export class MdzPackagerCore {
     return lines.join('\n');
   }
 
+  private static normalizeLf(content: string): string {
+    return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  }
+
+  private static isTextFile(path: string): boolean {
+    return /\.(md|markdown|json|txt|css|html|htm|xml|svg|yaml|yml|toml)$/i.test(path);
+  }
+
+  /**
+   * Builds an `.mdz` archive from input files and packaging options.
+   *
+   * @param files - Source file candidates.
+   * @param rootName - Root/source label for generated metadata.
+   * @param options - Packaging options.
+   * @param zipWriterFactory - Optional custom zip writer.
+   */
   public static async buildArchive(
     files: MdzPackInputFile[],
     rootName: string,
@@ -1036,10 +1321,20 @@ export class MdzPackagerCore {
 
     for (const item of selected) {
       if (item.file) {
-        const buffer = await item.file.arrayBuffer();
-        zip.file(item.archivePath, buffer);
+        if (MdzPackagerCore.isTextFile(item.archivePath)) {
+          const text = await item.file.text();
+          zip.file(item.archivePath, MdzPackagerCore.normalizeLf(text));
+        } else {
+          const buffer = await item.file.arrayBuffer();
+          zip.file(item.archivePath, buffer);
+        }
       } else {
-        zip.file(item.archivePath, item.text || '');
+        const content = item.text || '';
+        if (MdzPackagerCore.isTextFile(item.archivePath)) {
+          zip.file(item.archivePath, MdzPackagerCore.normalizeLf(content));
+        } else {
+          zip.file(item.archivePath, content);
+        }
       }
     }
 

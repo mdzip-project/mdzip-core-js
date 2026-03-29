@@ -1,7 +1,7 @@
 {
-  "name": "mdz-core-js",
+  "name": "mdzip-core-js",
   "version": "1.0.1-draft",
-  "description": "Core TypeScript/JavaScript library for MarkdownZip (.mdz): pack, unpack, validate, and resolve entry points.",
+  "description": "Core TypeScript/JavaScript library for MDZip (.mdz): pack, unpack, validate, and resolve entry points.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
@@ -22,14 +22,14 @@
     "test": "npm run build && node --test tests/spec-conformance.test.mjs"
   },
   "keywords": [
-    "markdownzip",
+    "mdzip",
     "mdz",
     "markdown",
     "zip"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/kylemwhite/mdz-core-js.git"
+    "url": "git+https://github.com/mdzip-project/mdzip-core-js.git"
   },
   "dependencies": {
     "jszip": "^3.10.1"
