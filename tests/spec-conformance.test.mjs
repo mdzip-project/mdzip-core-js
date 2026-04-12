@@ -241,7 +241,7 @@ test('generated producer manifest includes spec.version', () => {
   assert.ok(manifest);
   assert.equal(manifest.spec.version, '1.1.0-draft');
   assert.equal(manifest.spec.name, 'mdzip-spec');
-  assert.equal(manifest.producer.core.version, '1.0.1');
+  assert.equal(manifest.producer.core.version, '1.1.0-draft');
   assert.equal(manifest.producer.core.url, 'https://github.com/mdzip-project/mdzip-core-js');
   assert.equal(typeof manifest.created, 'string');
   assert.equal(typeof manifest.modified, 'string');
