@@ -239,9 +239,9 @@ test('generated producer manifest includes spec.version', () => {
   });
 
   assert.ok(manifest);
-  assert.equal(manifest.spec.version, '1.1.0-draft');
+  assert.equal(manifest.spec.version, '1.1.0');
   assert.equal(manifest.spec.name, 'mdzip-spec');
-  assert.equal(manifest.producer.core.version, '1.1.0-draft');
+  assert.equal(manifest.producer.core.version, '1.1.0');
   assert.equal(manifest.producer.core.url, 'https://github.com/mdzip-project/mdzip-core-js');
   assert.equal(typeof manifest.created, 'string');
   assert.equal(typeof manifest.modified, 'string');
@@ -257,7 +257,7 @@ test('generated producer manifest supports explicit project mode', () => {
 
   assert.ok(manifest);
   assert.equal(manifest.mode, 'project');
-  assert.equal(manifest.spec.version, '1.1.0-draft');
+  assert.equal(manifest.spec.version, '1.1.0');
 });
 
 test('buildArchive warns when multiple markdown files rely on implicit document mode', async () => {
@@ -461,7 +461,7 @@ test('addFile manifest replacement injects spec.version and refreshes modified',
   const manifestRaw = await outZip.file('manifest.json').async('text');
   const manifest = JSON.parse(manifestRaw);
 
-  assert.equal(manifest.spec.version, '1.1.0-draft');
+  assert.equal(manifest.spec.version, '1.1.0');
   assert.equal(manifest.created.by.name, 'Author');
   assert.ok(typeof manifest.modified === 'string' || typeof manifest.modified?.when === 'string');
 });
@@ -474,7 +474,7 @@ test('addFile refreshes manifest modified and injects missing spec.version', asy
 
   const result = await MdzArchiveCore.addFile(raw, 'assets/new.txt', 'new');
   assert.ok(result.manifest);
-  assert.equal(result.manifest.spec.version, '1.1.0-draft');
+  assert.equal(result.manifest.spec.version, '1.1.0');
   assert.notEqual(result.manifest.modified, '2000-01-01T00:00:00.0000000Z');
 });
 

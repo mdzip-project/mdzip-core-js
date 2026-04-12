@@ -1,8 +1,8 @@
 import JSZip from 'jszip';
 
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
-const PRODUCER_SPEC_VERSION = '1.1.0-draft';
-const CORE_LIBRARY_VERSION = '1.1.0-draft';
+const PRODUCER_SPEC_VERSION = '1.1.0';
+const CORE_LIBRARY_VERSION = '1.1.0';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
