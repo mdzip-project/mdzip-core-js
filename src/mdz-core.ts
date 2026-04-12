@@ -1,7 +1,9 @@
 import JSZip from 'jszip';
 
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
-const PRODUCER_SPEC_VERSION = '1.0.1-draft';
+const PRODUCER_SPEC_VERSION = '1.1.0-draft';
+const CORE_LIBRARY_VERSION = '1.0.1';
+const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
  * Binary input accepted for opening an existing `.mdz` archive.
@@ -122,6 +124,11 @@ export interface MdzManifestFileMapEntry {
 }
 
 /**
+ * Supported archive interpretation modes defined by the spec.
+ */
+export type MdzManifestMode = 'document' | 'project';
+
+/**
  * Parsed shape of `manifest.json` as supported by this library.
  *
  * Includes current fields plus legacy draft compatibility fields.
@@ -137,6 +144,8 @@ export interface MdzManifest {
   author?: MdzManifestAuthor;
   /** Human-readable document title. */
   title?: string;
+  /** Archive interpretation mode. */
+  mode?: MdzManifestMode;
   /** Primary Markdown entry path, archive-relative. */
   entryPoint?: string | null;
   /** Natural language tag (for example `en`, `fr-CA`). */
@@ -173,6 +182,8 @@ export interface MdzPackOptions {
   filters: string[];
   /** Optional manifest title override. */
   title?: string | null;
+  /** Optional archive interpretation mode. */
+  mode?: MdzManifestMode | null;
   /** Optional manifest entry point override. */
   entryPoint?: string | null;
   /** Optional language tag override. */
@@ -221,6 +232,8 @@ export interface MdzPackWarnings {
   sanitizedPathCount: number;
   /** Breakdown of skipped files by reason key. */
   skippedByReason: Record<string, number>;
+  /** Advisory packaging warnings for callers to surface to users. */
+  messages?: string[];
   /** True when no entry point could be resolved at build completion. */
   unresolvedEntry: boolean;
 }
@@ -231,7 +244,7 @@ export interface MdzPackWarnings {
 export interface MdzPackBuildResult {
   /** Final archive blob payload. */
   blob: Blob;
-  /** Manifest written to archive, when generated. */
+  /** Manifest written to archive, when present. */
   manifest: MdzManifest | null;
   /** Resolved primary entry path (or `null`). */
   resolvedEntryPoint: string | null;
@@ -292,6 +305,7 @@ export class MdzArchiveCore {
    */
   public static readonly IMAGE_MIME_TYPES = MDZ_IMAGE_MIME_TYPES;
   private static readonly SUPPORTED_MDZ_MAJOR = 1;
+  private static readonly SUPPORTED_MODES: readonly MdzManifestMode[] = ['document', 'project'];
   private static readonly SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
   private static readonly entriesCache = new WeakMap<ZipLike, Record<string, ZipEntry>>();
   private static readonly manifestCache = new WeakMap<ZipLike, MdzManifest | null>();
@@ -539,7 +553,7 @@ export class MdzArchiveCore {
     return MdzArchiveCore.entriesCache.get(this.zip)?.[normalized.toLowerCase()] ?? null;
   }
 
-  private static validateManifest(manifest: unknown): asserts manifest is MdzManifest {
+  public static validateManifest(manifest: unknown): asserts manifest is MdzManifest {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
       throw new Error('ERR_MANIFEST_INVALID: manifest.json must be a JSON object.');
     }
@@ -589,6 +603,14 @@ export class MdzArchiveCore {
 
     if (candidate.title != null && (typeof candidate.title !== 'string' || candidate.title.trim() === '')) {
       throw new Error('ERR_MANIFEST_INVALID: manifest.json "title" must be a non-empty string when provided.');
+    }
+    if (candidate.mode != null) {
+      if (typeof candidate.mode !== 'string') {
+        throw new Error('ERR_MANIFEST_INVALID: manifest.json "mode" must be a string when provided.');
+      }
+      if (!MdzArchiveCore.SUPPORTED_MODES.includes(candidate.mode as MdzManifestMode)) {
+        throw new Error(`ERR_MODE_UNSUPPORTED: manifest.json mode "${candidate.mode}" is not supported.`);
+      }
     }
     if (candidate.description != null && typeof candidate.description !== 'string') {
       throw new Error('ERR_MANIFEST_INVALID: manifest.json "description" must be a string when provided.');
@@ -705,6 +727,14 @@ export class MdzArchiveCore {
 
     MdzArchiveCore.manifestCache.set(this.zip, normalized);
     return normalized;
+  }
+
+  /**
+   * Resolves archive interpretation mode using manifest data or the spec default.
+   */
+  public async resolveMode(): Promise<MdzManifestMode> {
+    const manifest = await this.readManifest();
+    return manifest?.mode ?? 'document';
   }
 
   /**
@@ -1138,6 +1168,7 @@ export class MdzPackagerCore {
     const hasManifestOption =
       options.mapFiles
       || !!options.title
+      || !!options.mode
       || !!options.entryPoint
       || !!options.language
       || !!options.author
@@ -1155,10 +1186,13 @@ export class MdzPackagerCore {
       },
       producer: {
         core: {
-          name: 'mdzip-core-js'
+          name: 'mdzip-core-js',
+          version: CORE_LIBRARY_VERSION,
+          url: CORE_LIBRARY_URL
         }
       },
       title: options.title || rootName,
+      mode: options.mode || undefined,
       entryPoint: options.entryPoint || null,
       language: options.language || 'en',
       author: options.author ? { name: options.author } : undefined,
@@ -1220,6 +1254,22 @@ export class MdzPackagerCore {
     return /\.(md|markdown|json|txt|css|html|htm|xml|svg|yaml|yml|toml)$/i.test(path);
   }
 
+  private static async readProvidedManifest(selected: MdzSelectedFile[]): Promise<MdzManifest | null> {
+    const manifestItem = selected.find((item) => item.archivePath.toLowerCase() === 'manifest.json');
+    if (!manifestItem) return null;
+
+    const raw = manifestItem.file ? await manifestItem.file.text() : (manifestItem.text ?? '');
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(raw);
+    } catch {
+      throw new Error('ERR_MANIFEST_INVALID: manifest.json is not valid JSON');
+    }
+
+    MdzArchiveCore.validateManifest(manifest);
+    return manifest as MdzManifest;
+  }
+
   /**
    * Builds an `.mdz` archive from input files and packaging options.
    *
@@ -1242,7 +1292,7 @@ export class MdzPackagerCore {
       throw new Error('ERR_PACK_NO_INPUT: No files found to package.');
     }
 
-    const manifest = MdzPackagerCore.buildManifestFromOptions(rootName, options);
+    let manifest = MdzPackagerCore.buildManifestFromOptions(rootName, options);
     const skipMap = new Map<string, number>();
     const usedPaths = new Set<string>();
     const selected: MdzSelectedFile[] = [];
@@ -1293,15 +1343,27 @@ export class MdzPackagerCore {
       }
     }
 
+    if (!manifest) {
+      manifest = await MdzPackagerCore.readProvidedManifest(selected);
+    }
+
     let archivePaths = selected.map((f) => f.archivePath);
     let resolvedEntryPoint = MdzPackagerCore.resolveEntryPoint(archivePaths, manifest);
+    const warningMessages: string[] = [];
+    const markdownPaths = archivePaths.filter(MdzArchiveCore.isMarkdownFile);
+
+    if (!manifest?.mode && markdownPaths.length > 1) {
+      warningMessages.push(
+        'Archive contains multiple Markdown files and no explicit manifest.mode; consumers will default to document mode. If these files are intended as separate documents, set mode: "project".'
+      );
+    }
 
     if (options.createIndex && !resolvedEntryPoint) {
       if (manifest?.entryPoint) {
         throw new Error(`ERR_PACK_ENTRYPOINT_MISSING: Manifest entry-point "${manifest.entryPoint}" does not exist.`);
       }
-      const markdownPaths = archivePaths.filter(MdzArchiveCore.isMarkdownFile).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-      const generated = MdzPackagerCore.buildGeneratedIndex(markdownPaths, options.title || rootName);
+      const sortedMarkdownPaths = markdownPaths.slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+      const generated = MdzPackagerCore.buildGeneratedIndex(sortedMarkdownPaths, options.title || rootName);
       selected.push({ archivePath: 'index.md', originalPath: '[generated]', text: generated });
       archivePaths = selected.map((f) => f.archivePath);
       resolvedEntryPoint = 'index.md';
@@ -1354,6 +1416,7 @@ export class MdzPackagerCore {
         invalidPathCount,
         sanitizedPathCount,
         skippedByReason: Object.fromEntries(skipMap.entries()),
+        messages: warningMessages,
         unresolvedEntry: !resolvedEntryPoint
       }
     };

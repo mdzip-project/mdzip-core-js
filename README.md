@@ -4,12 +4,12 @@ Core TypeScript/JavaScript library for MDZip (`.mdz`) archives.
 
 Current scope (core only):
 - open/unpack archive data
-- manifest validation (MDZip spec `1.0.1-draft` aligned)
+- manifest validation (MDZip spec `1.1.0-draft` aligned, including `manifest.mode`)
 - entry-point resolution
 - archive conformance validation (`errors` + `warnings`)
 - archive mutation helpers (`addFile`, `removeFile`) with entry-point safety
 - path validation + resolution
-- package build helpers
+- package build helpers, including explicit `mode` support and advisory packaging warnings
 
 ## Install
 

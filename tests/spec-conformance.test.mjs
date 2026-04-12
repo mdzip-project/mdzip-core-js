@@ -121,6 +121,42 @@ test('manifest without spec.version remains readable', async () => {
   assert.equal(manifest.title, 'Hello world');
 });
 
+test('manifest mode defaults to document when omitted', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# hello\n');
+  zip.file('manifest.json', JSON.stringify({ title: 'Hello world' }));
+
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+  const archive = await MdzArchiveCore.open(raw);
+
+  assert.equal(await archive.resolveMode(), 'document');
+});
+
+test('manifest project mode is accepted and reported', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# hello\n');
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, mode: 'project', entryPoint: 'index.md' }));
+
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+  const archive = await MdzArchiveCore.open(raw);
+  const manifest = await archive.readManifest();
+
+  assert.ok(manifest);
+  assert.equal(manifest.mode, 'project');
+  assert.equal(await archive.resolveMode(), 'project');
+});
+
+test('manifest with unsupported mode is rejected', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# hello\n');
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, mode: 'Document' }));
+
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+  const archive = await MdzArchiveCore.open(raw);
+
+  await assert.rejects(() => archive.readManifest(), /ERR_MODE_UNSUPPORTED/);
+});
+
 test('manifest with unsupported spec.version major is rejected', async () => {
   const zip = new JSZip();
   zip.file('index.md', '# hello\n');
@@ -203,22 +239,134 @@ test('generated producer manifest includes spec.version', () => {
   });
 
   assert.ok(manifest);
-  assert.equal(manifest.spec.version, '1.0.1-draft');
+  assert.equal(manifest.spec.version, '1.1.0-draft');
   assert.equal(manifest.spec.name, 'mdzip-spec');
+  assert.equal(manifest.producer.core.version, '1.0.1');
+  assert.equal(manifest.producer.core.url, 'https://github.com/mdzip-project/mdzip-core-js');
   assert.equal(typeof manifest.created, 'string');
   assert.equal(typeof manifest.modified, 'string');
+});
+
+test('generated producer manifest supports explicit project mode', () => {
+  const manifest = MdzPackagerCore.buildManifestFromOptions('Project Sample', {
+    createIndex: false,
+    mapFiles: false,
+    filters: [],
+    mode: 'project'
+  });
+
+  assert.ok(manifest);
+  assert.equal(manifest.mode, 'project');
+  assert.equal(manifest.spec.version, '1.1.0-draft');
+});
+
+test('buildArchive warns when multiple markdown files rely on implicit document mode', async () => {
+  const result = await MdzPackagerCore.buildArchive(
+    [
+      { path: 'chapter-01.md', text: '# One\n' },
+      { path: 'chapter-02.md', text: '# Two\n' }
+    ],
+    'Sample',
+    {
+      createIndex: true,
+      mapFiles: false,
+      filters: ['**/*.md']
+    }
+  );
+
+  assert.ok(
+    result.warnings.messages.some((message) => /multiple Markdown files/i.test(message) && /mode: "project"/i.test(message))
+  );
+  assert.equal(result.resolvedEntryPoint, 'index.md');
+});
+
+test('buildArchive does not warn when multiple markdown files explicitly use project mode', async () => {
+  const result = await MdzPackagerCore.buildArchive(
+    [
+      { path: 'guide/intro.md', text: '# Intro\n' },
+      { path: 'reference/api.md', text: '# API\n' }
+    ],
+    'Project Sample',
+    {
+      createIndex: false,
+      mapFiles: false,
+      filters: ['**/*.md'],
+      mode: 'project',
+      entryPoint: 'guide/intro.md'
+    }
+  );
+
+  assert.deepEqual(result.warnings.messages, []);
+  assert.equal(result.manifest?.mode, 'project');
+});
+
+test('buildArchive honors a valid user-supplied manifest.json', async () => {
+  const result = await MdzPackagerCore.buildArchive(
+    [
+      {
+        path: 'manifest.json',
+        text: JSON.stringify({
+          spec: { version: '1.1.0' },
+          mode: 'project',
+          entryPoint: 'guide/intro.md'
+        })
+      },
+      { path: 'guide/intro.md', text: '# Intro\n' },
+      { path: 'reference/api.md', text: '# API\n' }
+    ],
+    'Project Sample',
+    {
+      createIndex: false,
+      mapFiles: false,
+      filters: ['**/*.md', 'manifest.json']
+    }
+  );
+
+  assert.equal(result.manifest?.mode, 'project');
+  assert.equal(result.resolvedEntryPoint, 'guide/intro.md');
+  assert.deepEqual(result.warnings.messages, []);
+});
+
+test('buildArchive rejects an invalid user-supplied manifest.json', async () => {
+  await assert.rejects(
+    () => MdzPackagerCore.buildArchive(
+      [
+        { path: 'manifest.json', text: '{ invalid json' },
+        { path: 'index.md', text: '# Hello\n' }
+      ],
+      'Sample',
+      {
+        createIndex: false,
+        mapFiles: false,
+        filters: ['**/*.md', 'manifest.json']
+      }
+    ),
+    /ERR_MANIFEST_INVALID/
+  );
 });
 
 test('validate warns when manifest cover target is missing', async () => {
   const zip = new JSZip();
   zip.file('index.md', '# hello\n');
-  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.0.1' }, cover: 'assets/images/cover.png' }));
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, cover: 'assets/images/cover.png' }));
 
   const raw = await zip.generateAsync({ type: 'uint8array' });
   const result = await MdzArchiveCore.validate(raw);
 
   assert.equal(result.isValid, true);
   assert.ok(result.warnings.some((w) => /cover/i.test(w)));
+});
+
+test('validate rejects unsupported manifest mode', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# hello\n');
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, mode: 'PROJECT' }));
+
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+  const result = await MdzArchiveCore.validate(raw);
+
+  assert.equal(result.isValid, false);
+  assert.ok(result.errors.some((e) => /ERR_MODE_UNSUPPORTED/.test(e)));
 });
 
 test('validate warns when manifest spec.version major is lower', async () => {
@@ -313,7 +461,7 @@ test('addFile manifest replacement injects spec.version and refreshes modified',
   const manifestRaw = await outZip.file('manifest.json').async('text');
   const manifest = JSON.parse(manifestRaw);
 
-  assert.equal(manifest.spec.version, '1.0.1-draft');
+  assert.equal(manifest.spec.version, '1.1.0-draft');
   assert.equal(manifest.created.by.name, 'Author');
   assert.ok(typeof manifest.modified === 'string' || typeof manifest.modified?.when === 'string');
 });
@@ -326,7 +474,7 @@ test('addFile refreshes manifest modified and injects missing spec.version', asy
 
   const result = await MdzArchiveCore.addFile(raw, 'assets/new.txt', 'new');
   assert.ok(result.manifest);
-  assert.equal(result.manifest.spec.version, '1.0.1-draft');
+  assert.equal(result.manifest.spec.version, '1.1.0-draft');
   assert.notEqual(result.manifest.modified, '2000-01-01T00:00:00.0000000Z');
 });
 
