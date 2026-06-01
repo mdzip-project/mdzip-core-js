@@ -1,4 +1,4 @@
-import JSZip from 'jszip';
+import JSZip from '@progress/jszip-esm';
 
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.1.0';
@@ -283,6 +283,74 @@ export interface MdzArchiveMutationResult {
 }
 
 /**
+ * Controls archive path/entry listing output.
+ */
+export interface MdzArchiveListOptions {
+  /** Include directory entries. Defaults to `false`. */
+  includeDirectories?: boolean;
+  /** Normalize paths via `normalizePath`. Defaults to `true`. */
+  normalize?: boolean;
+  /** Sort output paths case-insensitively. Defaults to `true`. */
+  sort?: boolean;
+}
+
+/**
+ * Metadata for one archive entry returned by `listEntries`.
+ */
+export interface MdzArchiveEntryInfo {
+  /** Archive-relative path. */
+  path: string;
+  /** True when entry extension is Markdown. */
+  isMarkdown: boolean;
+  /** True when entry extension is known image type. */
+  isImage: boolean;
+  /** True when entry is a directory. */
+  isDirectory: boolean;
+}
+
+/**
+ * Optional controls for orphaned-asset analysis.
+ */
+export interface MdzOrphanedAssetsOptions {
+  /**
+   * Markdown scan mode.
+   * - `entrypoint`: scan only the resolved/selected entry point (default)
+   * - `all-markdown`: scan all Markdown files in archive
+   */
+  scanMode?: 'entrypoint' | 'all-markdown';
+  /** Optional explicit markdown entry path to scan for `entrypoint` mode. */
+  entryPoint?: string;
+}
+
+/**
+ * One unresolved or ignored image reference observed during scan.
+ */
+export interface MdzOrphanedAssetReferenceIssue {
+  /** Markdown file where the reference was found. */
+  sourcePath: string;
+  /** Raw reference value from Markdown. */
+  reference: string;
+  /** Normalized reason for why the reference was not counted. */
+  reason: 'unsupported-scheme' | 'invalid-path' | 'not-found' | 'not-asset';
+}
+
+/**
+ * Result for orphaned image analysis.
+ */
+export interface MdzOrphanedAssetsResult {
+  /** Markdown files scanned for references. */
+  scannedMarkdownPaths: string[];
+  /** All image-asset paths in archive considered by v1 analysis. */
+  assetPaths: string[];
+  /** Asset paths referenced by scanned markdown and/or manifest cover. */
+  referencedAssetPaths: string[];
+  /** Asset paths not referenced by scanned markdown/cover. */
+  orphanedAssetPaths: string[];
+  /** References that could not be counted as valid image asset references. */
+  unresolvedReferences: MdzOrphanedAssetReferenceIssue[];
+}
+
+/**
  * Extension-to-MIME map for common image assets in MDZip archives.
  */
 export const MDZ_IMAGE_MIME_TYPES: Record<string, string> = {
@@ -307,6 +375,7 @@ export class MdzArchiveCore {
   private static readonly SUPPORTED_MDZ_MAJOR = 1;
   private static readonly SUPPORTED_MODES: readonly MdzManifestMode[] = ['document', 'project'];
   private static readonly SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  private static readonly MARKDOWN_IMAGE_REF_RE = /!\[[^\]]*\]\(([^)\n]+)\)/g;
   private static readonly entriesCache = new WeakMap<ZipLike, Record<string, ZipEntry>>();
   private static readonly manifestCache = new WeakMap<ZipLike, MdzManifest | null>();
 
@@ -360,7 +429,7 @@ export class MdzArchiveCore {
       throw new Error(`ERR_PATH_INVALID: ${pathError}`);
     }
 
-    const zip = await JSZip.loadAsync(input as unknown as Parameters<typeof JSZip.loadAsync>[0]) as unknown as MutableZipLike;
+    const zip = await MdzArchiveCore.loadZip(input);
     const targetLower = targetPath.toLowerCase();
     const archivePaths = MdzArchiveCore.getArchivePaths(zip);
     const nextArchivePaths = archivePaths.filter((p) => p.toLowerCase() !== targetLower);
@@ -410,7 +479,7 @@ export class MdzArchiveCore {
       throw new Error(`ERR_PATH_INVALID: ${pathError}`);
     }
 
-    const zip = await JSZip.loadAsync(input as unknown as Parameters<typeof JSZip.loadAsync>[0]) as unknown as MutableZipLike;
+    const zip = await MdzArchiveCore.loadZip(input);
     const targetLower = targetPath.toLowerCase();
     const archivePaths = MdzArchiveCore.getArchivePaths(zip);
     const exists = archivePaths.some((p) => p.toLowerCase() === targetLower);
@@ -437,13 +506,82 @@ export class MdzArchiveCore {
     return MdzArchiveCore.finalizeMutation(zip);
   }
 
+  /**
+   * Removes multiple archive entries in one mutation operation.
+   *
+   * @param input - Existing archive bytes.
+   * @param archiveEntryPaths - Archive-relative paths to remove.
+   */
+  public static async removeFiles(input: MdzCoreArchiveBinary, archiveEntryPaths: string[]): Promise<MdzArchiveMutationResult> {
+    const targets = archiveEntryPaths.map((p) => {
+      const normalized = MdzPackagerCore.normalizePath(p);
+      const pathError = MdzArchiveCore.validateArchivePath(normalized);
+      if (pathError) {
+        throw new Error(`ERR_PATH_INVALID: ${pathError}`);
+      }
+      return normalized;
+    });
+
+    if (targets.length === 0) {
+      const zip = await MdzArchiveCore.loadZip(input);
+      return MdzArchiveCore.finalizeMutation(zip);
+    }
+
+    const zip = await MdzArchiveCore.loadZip(input);
+    const targetSet = new Set(targets.map((p) => p.toLowerCase()));
+    const archivePaths = MdzArchiveCore.getArchivePaths(zip);
+
+    for (const target of targetSet) {
+      if (!archivePaths.some((p) => p.toLowerCase() === target)) {
+        throw new Error(`ERR_NOT_FOUND: Entry "${target}" was not found in archive.`);
+      }
+    }
+
+    const nextArchivePaths = archivePaths.filter((p) => !targetSet.has(p.toLowerCase()));
+    const removesManifest = targetSet.has('manifest.json');
+    const existingManifestObject = removesManifest ? null : await MdzArchiveCore.readExistingManifestObject(zip, true);
+
+    if (existingManifestObject) {
+      MdzArchiveCore.validateManifest(existingManifestObject);
+    }
+    MdzArchiveCore.ensureCreatableEntryPoint(nextArchivePaths, existingManifestObject as MdzManifest | null);
+
+    for (const target of targetSet) {
+      MdzArchiveCore.removeEntryIgnoreCase(zip, target);
+    }
+
+    if (existingManifestObject) {
+      const refreshed = MdzArchiveCore.stampManifestObject(existingManifestObject, false);
+      MdzArchiveCore.removeEntryIgnoreCase(zip, 'manifest.json');
+      zip.file('manifest.json', MdzArchiveCore.normaliseLf(JSON.stringify(refreshed, null, 2)));
+    }
+
+    return MdzArchiveCore.finalizeMutation(zip);
+  }
+
+  /**
+   * Finds orphaned image assets in an archive.
+   *
+   * @param input - Existing archive bytes.
+   * @param options - Scan options.
+   */
+  public static async findOrphanedAssets(input: MdzCoreArchiveBinary, options?: MdzOrphanedAssetsOptions): Promise<MdzOrphanedAssetsResult> {
+    const archive = await MdzArchiveCore.open(input);
+    return archive.findOrphanedAssets(options);
+  }
+
   private static getDefaultZipFactory(): ZipFactoryLike {
     return {
       async loadAsync(data: MdzCoreArchiveBinary): Promise<ZipLike> {
-        const zip = await JSZip.loadAsync(data as unknown as Parameters<typeof JSZip.loadAsync>[0]);
+        const zip = await new JSZip().loadAsync(data as unknown as Blob | ArrayBuffer | Uint8Array);
         return zip as unknown as ZipLike;
       }
     };
+  }
+
+  private static async loadZip(input: MdzCoreArchiveBinary): Promise<MutableZipLike> {
+    const zip = await new JSZip().loadAsync(input as unknown as Blob | ArrayBuffer | Uint8Array);
+    return zip as unknown as MutableZipLike;
   }
 
   /**
@@ -551,6 +689,158 @@ export class MdzArchiveCore {
     }
 
     return MdzArchiveCore.entriesCache.get(this.zip)?.[normalized.toLowerCase()] ?? null;
+  }
+
+  /**
+   * Lists archive paths.
+   *
+   * @param options - Listing controls.
+   */
+  public listPaths(options?: MdzArchiveListOptions): string[] {
+    return MdzArchiveCore.getArchivePaths(this.zip, options);
+  }
+
+  /**
+   * Lists archive entries with basic type metadata.
+   *
+   * @param options - Listing controls.
+   */
+  public listEntries(options?: MdzArchiveListOptions): MdzArchiveEntryInfo[] {
+    const entries = MdzArchiveCore.getArchiveEntries(this.zip, options);
+    return entries.map((entry) => ({
+      path: entry.path,
+      isMarkdown: !entry.isDirectory && MdzArchiveCore.isMarkdownFile(entry.path),
+      isImage: !entry.isDirectory && MdzArchiveCore.isImagePath(entry.path),
+      isDirectory: entry.isDirectory
+    }));
+  }
+
+  /**
+   * Returns true if an entry path exists (file or directory).
+   *
+   * @param path - Archive-relative path.
+   */
+  public hasEntry(path: string): boolean {
+    return this.findEntryWithDirectoryFallback(path) != null;
+  }
+
+  /**
+   * Reads UTF-8 text content from an entry.
+   *
+   * @param path - Archive-relative file path.
+   */
+  public async readText(path: string): Promise<string> {
+    const entry = this.getFileEntryOrThrow(path);
+    return String(await entry.async('text'));
+  }
+
+  /**
+   * Reads raw bytes from an entry.
+   *
+   * @param path - Archive-relative file path.
+   */
+  public async readBytes(path: string): Promise<Uint8Array> {
+    const entry = this.getFileEntryOrThrow(path);
+    const out = await entry.async('arraybuffer');
+    return new Uint8Array(out as ArrayBuffer);
+  }
+
+  /**
+   * Reads entry content as raw base64 (no data URI prefix).
+   *
+   * @param path - Archive-relative file path.
+   */
+  public async readBase64(path: string): Promise<string> {
+    const entry = this.getFileEntryOrThrow(path);
+    return String(await entry.async('base64'));
+  }
+
+  /**
+   * Reads entry content and returns a data URI string.
+   *
+   * @param path - Archive-relative file path.
+   * @param fallbackMime - Optional fallback MIME when extension is unknown.
+   */
+  public async readDataUri(path: string, fallbackMime?: string): Promise<string> {
+    const normalizedPath = MdzArchiveCore.normalizePath(path);
+    const base64 = await this.readBase64(normalizedPath);
+    const ext = MdzArchiveCore.getPathExtension(normalizedPath);
+    const mime = MDZ_IMAGE_MIME_TYPES[ext] ?? (fallbackMime?.trim() || 'application/octet-stream');
+    return `data:${mime};base64,${base64}`;
+  }
+
+  /**
+   * Finds orphaned image assets from markdown references.
+   *
+   * @param options - Scan options.
+   */
+  public async findOrphanedAssets(options?: MdzOrphanedAssetsOptions): Promise<MdzOrphanedAssetsResult> {
+    const allEntries = this.listEntries();
+    const assetPaths = allEntries
+      .filter((entry) => entry.isImage)
+      .map((entry) => entry.path)
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+    const assetPathSet = new Set(assetPaths.map((p) => p.toLowerCase()));
+
+    const scanMode = options?.scanMode ?? 'entrypoint';
+    const scannedMarkdownPaths = scanMode === 'all-markdown'
+      ? allEntries.filter((entry) => entry.isMarkdown).map((entry) => entry.path)
+      : [options?.entryPoint ? MdzArchiveCore.normalizePath(options.entryPoint) : await this.resolveEntryPoint()];
+
+    const referencedAssets = new Set<string>();
+    const unresolvedReferences: MdzOrphanedAssetReferenceIssue[] = [];
+
+    for (const markdownPath of scannedMarkdownPaths) {
+      const markdown = await this.readText(markdownPath);
+      const refs = MdzArchiveCore.extractMarkdownImageReferences(markdown);
+      for (const ref of refs) {
+        if (MdzArchiveCore.hasUriScheme(ref)) {
+          unresolvedReferences.push({ sourcePath: markdownPath, reference: ref, reason: 'unsupported-scheme' });
+          continue;
+        }
+
+        let resolved: string;
+        try {
+          resolved = MdzArchiveCore.normalizePath(MdzArchiveCore.resolvePath(markdownPath, ref));
+        } catch {
+          unresolvedReferences.push({ sourcePath: markdownPath, reference: ref, reason: 'invalid-path' });
+          continue;
+        }
+
+        const entry = this.findEntryWithDirectoryFallback(resolved);
+        if (!entry || entry.dir) {
+          unresolvedReferences.push({ sourcePath: markdownPath, reference: ref, reason: 'not-found' });
+          continue;
+        }
+
+        if (!MdzArchiveCore.isImagePath(resolved) || !assetPathSet.has(resolved.toLowerCase())) {
+          unresolvedReferences.push({ sourcePath: markdownPath, reference: ref, reason: 'not-asset' });
+          continue;
+        }
+
+        referencedAssets.add(MdzArchiveCore.resolveAssetPathCase(assetPaths, resolved));
+      }
+    }
+
+    const manifest = await this.readManifest();
+    if (manifest?.cover) {
+      const cover = MdzArchiveCore.normalizePath(manifest.cover);
+      if (assetPathSet.has(cover.toLowerCase())) {
+        referencedAssets.add(MdzArchiveCore.resolveAssetPathCase(assetPaths, cover));
+      }
+    }
+
+    const referencedAssetPaths = Array.from(referencedAssets).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+    const referencedSet = new Set(referencedAssetPaths.map((p) => p.toLowerCase()));
+    const orphanedAssetPaths = assetPaths.filter((p) => !referencedSet.has(p.toLowerCase()));
+
+    return {
+      scannedMarkdownPaths,
+      assetPaths,
+      referencedAssetPaths,
+      orphanedAssetPaths,
+      unresolvedReferences
+    };
   }
 
   public static validateManifest(manifest: unknown): asserts manifest is MdzManifest {
@@ -842,10 +1132,102 @@ export class MdzArchiveCore {
     throw new Error('ERR_ENTRYPOINT_UNRESOLVED: No Markdown file found at the archive root.');
   }
 
-  private static getArchivePaths(zip: ZipLike): string[] {
-    return Object.keys(zip.files)
-      .filter((p) => !zip.files[p]?.dir)
-      .map((p) => MdzArchiveCore.normalizePath(p));
+  private static getArchivePaths(zip: ZipLike, options?: MdzArchiveListOptions): string[] {
+    return MdzArchiveCore.getArchiveEntries(zip, options).map((entry) => entry.path);
+  }
+
+  private static getArchiveEntries(zip: ZipLike, options?: MdzArchiveListOptions): Array<{ path: string; isDirectory: boolean }> {
+    const includeDirectories = options?.includeDirectories === true;
+    const normalize = options?.normalize !== false;
+    const sort = options?.sort !== false;
+
+    const entries = Object.entries(zip.files)
+      .filter(([, entry]) => includeDirectories || !entry?.dir)
+      .map(([path, entry]) => ({
+        path: normalize ? MdzArchiveCore.normalizePath(path) : path,
+        isDirectory: !!entry?.dir
+      }));
+
+    if (sort) {
+      entries.sort((a, b) => a.path.localeCompare(b.path, undefined, { sensitivity: 'base' }));
+    }
+
+    return entries;
+  }
+
+  private findEntryWithDirectoryFallback(path: string): ZipEntry | null {
+    const normalized = MdzArchiveCore.normalizePath(path);
+    const direct = this.findEntry(normalized);
+    if (direct) return direct;
+
+    if (normalized.endsWith('/')) {
+      return this.findEntry(normalized.slice(0, -1));
+    }
+    return this.findEntry(`${normalized}/`);
+  }
+
+  private getFileEntryOrThrow(path: string): ZipEntry {
+    const normalized = MdzArchiveCore.normalizePath(path);
+    const entry = this.findEntryWithDirectoryFallback(normalized);
+    if (!entry) {
+      throw new Error(`ERR_NOT_FOUND: Entry "${normalized}" was not found in archive.`);
+    }
+    if (entry.dir) {
+      throw new Error(`ERR_IS_DIRECTORY: Entry "${normalized}" is a directory.`);
+    }
+    return entry;
+  }
+
+  private static getPathExtension(path: string): string {
+    const slash = path.lastIndexOf('/');
+    const dot = path.lastIndexOf('.');
+    if (dot <= slash) return '';
+    return path.slice(dot + 1).toLowerCase();
+  }
+
+  private static isImagePath(path: string): boolean {
+    return MdzArchiveCore.getPathExtension(path) in MDZ_IMAGE_MIME_TYPES;
+  }
+
+  private static extractMarkdownImageReferences(markdown: string): string[] {
+    const refs: string[] = [];
+    const re = new RegExp(MdzArchiveCore.MARKDOWN_IMAGE_REF_RE.source, 'g');
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(markdown)) != null) {
+      const raw = match[1]?.trim();
+      if (!raw) continue;
+      refs.push(MdzArchiveCore.cleanMarkdownLinkTarget(raw));
+    }
+    return refs;
+  }
+
+  private static cleanMarkdownLinkTarget(raw: string): string {
+    let target = raw.trim();
+    if (target.startsWith('<') && target.endsWith('>')) {
+      target = target.slice(1, -1).trim();
+    }
+
+    const quotedTitleIndex = target.search(/\s+"/);
+    if (quotedTitleIndex > 0) {
+      target = target.slice(0, quotedTitleIndex).trim();
+    } else {
+      const singleQuotedTitleIndex = target.search(/\s+'/);
+      if (singleQuotedTitleIndex > 0) {
+        target = target.slice(0, singleQuotedTitleIndex).trim();
+      }
+    }
+
+    return target;
+  }
+
+  private static hasUriScheme(value: string): boolean {
+    return /^[A-Za-z][A-Za-z\d+\-.]*:/.test(value);
+  }
+
+  private static resolveAssetPathCase(assetPaths: string[], resolvedPath: string): string {
+    const lower = resolvedPath.toLowerCase();
+    const exact = assetPaths.find((p) => p.toLowerCase() === lower);
+    return exact ?? resolvedPath;
   }
 
   private static removeEntryIgnoreCase(zip: MutableZipLike, targetPath: string): void {

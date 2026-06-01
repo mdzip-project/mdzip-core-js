@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import JSZip from 'jszip';
+import JSZip from '@progress/jszip-esm';
 
 import { MdzArchiveCore, MdzPackagerCore } from '../dist/index.js';
 
@@ -412,7 +412,7 @@ test('addFile adds a new entry', async () => {
   const result = await MdzArchiveCore.addFile(raw, 'assets/note.txt', 'line1\r\nline2\r\n');
   assert.equal(result.resolvedEntryPoint, 'index.md');
 
-  const outZip = await JSZip.loadAsync(await result.blob.arrayBuffer());
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
   const added = outZip.file('assets/note.txt');
   assert.ok(added);
   assert.equal(await added.async('text'), 'line1\nline2\n');
@@ -424,7 +424,7 @@ test('addFile replaces existing entry', async () => {
   const raw = await zip.generateAsync({ type: 'uint8array' });
 
   const result = await MdzArchiveCore.addFile(raw, 'index.md', '# new\n');
-  const outZip = await JSZip.loadAsync(await result.blob.arrayBuffer());
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
   const entry = outZip.file('index.md');
   assert.ok(entry);
   assert.equal(await entry.async('text'), '# new\n');
@@ -457,7 +457,7 @@ test('addFile manifest replacement injects spec.version and refreshes modified',
   });
 
   const result = await MdzArchiveCore.addFile(raw, 'manifest.json', replacement);
-  const outZip = await JSZip.loadAsync(await result.blob.arrayBuffer());
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
   const manifestRaw = await outZip.file('manifest.json').async('text');
   const manifest = JSON.parse(manifestRaw);
 
@@ -487,7 +487,7 @@ test('removeFile removes entry and keeps archive valid', async () => {
   const result = await MdzArchiveCore.removeFile(raw, 'assets/one.txt');
   assert.equal(result.resolvedEntryPoint, 'index.md');
 
-  const outZip = await JSZip.loadAsync(await result.blob.arrayBuffer());
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
   assert.equal(outZip.file('assets/one.txt'), null);
   assert.ok(outZip.file('index.md'));
 });
@@ -512,4 +512,150 @@ test('removeFile rejects when entrypoint becomes unresolved', async () => {
     () => MdzArchiveCore.removeFile(raw, 'index.md'),
     /ERR_ENTRYPOINT_UNRESOLVED/
   );
+});
+
+test('listPaths defaults to sorted non-directory paths', async () => {
+  const zip = new JSZip();
+  zip.file('b.md', '# b\n');
+  zip.file('a.md', '# a\n');
+  zip.folder('assets/images');
+  zip.file('assets/images/p.png', new Uint8Array([1, 2, 3]));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const archive = await MdzArchiveCore.open(raw);
+  assert.deepEqual(archive.listPaths(), ['a.md', 'assets/images/p.png', 'b.md']);
+});
+
+test('listEntries reports markdown/image/directory metadata', async () => {
+  const zip = new JSZip();
+  zip.folder('assets');
+  zip.file('index.md', '# hello\n');
+  zip.file('assets/pic.PNG', new Uint8Array([1, 2, 3]));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const archive = await MdzArchiveCore.open(raw);
+  const entries = archive.listEntries({ includeDirectories: true });
+  const byPath = Object.fromEntries(entries.map((e) => [e.path, e]));
+  const assetsDir = entries.find((e) => e.isDirectory && (e.path === 'assets' || e.path === 'assets/'));
+
+  assert.ok(assetsDir);
+  assert.equal(byPath['index.md'].isMarkdown, true);
+  assert.equal(byPath['assets/pic.PNG'].isImage, true);
+});
+
+test('hasEntry supports file, directory, and case-insensitive lookup', async () => {
+  const zip = new JSZip();
+  zip.folder('assets');
+  zip.file('assets/one.txt', '1');
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const archive = await MdzArchiveCore.open(raw);
+  assert.equal(archive.hasEntry('assets/one.txt'), true);
+  assert.equal(archive.hasEntry('ASSETS/ONE.TXT'), true);
+  assert.equal(archive.hasEntry('assets'), true);
+  assert.equal(archive.hasEntry('missing.txt'), false);
+});
+
+test('readText/readBytes/readBase64/readDataUri work for file entries', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# hello\n');
+  zip.file('assets/logo.png', new Uint8Array([0x01, 0x02, 0x03, 0x04]));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const archive = await MdzArchiveCore.open(raw);
+
+  assert.equal(await archive.readText('index.md'), '# hello\n');
+  assert.deepEqual(Array.from(await archive.readBytes('assets/logo.png')), [1, 2, 3, 4]);
+  assert.equal(await archive.readBase64('assets/logo.png'), 'AQIDBA==');
+  assert.equal(await archive.readDataUri('assets/logo.png'), 'data:image/png;base64,AQIDBA==');
+  assert.equal(await archive.readDataUri('index.md'), 'data:application/octet-stream;base64,IyBoZWxsbwo=');
+});
+
+test('read* APIs reject missing and directory paths with typed errors', async () => {
+  const zip = new JSZip();
+  zip.folder('assets');
+  zip.file('index.md', '# hello\n');
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const archive = await MdzArchiveCore.open(raw);
+
+  await assert.rejects(() => archive.readText('missing.md'), /ERR_NOT_FOUND/);
+  await assert.rejects(() => archive.readText('assets'), /ERR_IS_DIRECTORY/);
+});
+
+test('removeFiles removes multiple entries case-insensitively', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# hello\n');
+  zip.file('assets/one.txt', '1');
+  zip.file('assets/two.txt', '2');
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const result = await MdzArchiveCore.removeFiles(raw, ['ASSETS/ONE.TXT', 'assets/two.txt']);
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
+
+  assert.equal(outZip.file('assets/one.txt'), null);
+  assert.equal(outZip.file('assets/two.txt'), null);
+  assert.ok(outZip.file('index.md'));
+});
+
+test('removeFiles rejects when any target does not exist', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# hello\n');
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  await assert.rejects(
+    () => MdzArchiveCore.removeFiles(raw, ['missing.txt']),
+    /ERR_NOT_FOUND/
+  );
+});
+
+test('removeFiles rejects when entrypoint becomes unresolved', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# hello\n');
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  await assert.rejects(
+    () => MdzArchiveCore.removeFiles(raw, ['index.md']),
+    /ERR_ENTRYPOINT_UNRESOLVED/
+  );
+});
+
+test('findOrphanedAssets finds stale image assets with relative references and cover retention', async () => {
+  const zip = new JSZip();
+  zip.file('docs/start.md', [
+    '![one](../assets/one.png)',
+    '![bad](../assets/missing.png)',
+    '![external](https://example.com/logo.png)',
+    '![notasset](../docs/notes.txt)'
+  ].join('\n'));
+  zip.file('docs/notes.txt', 'note');
+  zip.file('assets/one.png', new Uint8Array([1]));
+  zip.file('assets/cover.png', new Uint8Array([2]));
+  zip.file('assets/orphan.png', new Uint8Array([3]));
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, entryPoint: 'docs/start.md', cover: 'assets/cover.png' }));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const result = await MdzArchiveCore.findOrphanedAssets(raw);
+
+  assert.deepEqual(result.scannedMarkdownPaths, ['docs/start.md']);
+  assert.deepEqual(result.assetPaths, ['assets/cover.png', 'assets/one.png', 'assets/orphan.png']);
+  assert.deepEqual(result.referencedAssetPaths, ['assets/cover.png', 'assets/one.png']);
+  assert.deepEqual(result.orphanedAssetPaths, ['assets/orphan.png']);
+  assert.ok(result.unresolvedReferences.some((r) => r.reason === 'not-found'));
+  assert.ok(result.unresolvedReferences.some((r) => r.reason === 'unsupported-scheme'));
+  assert.ok(result.unresolvedReferences.some((r) => r.reason === 'not-asset'));
+});
+
+test('findOrphanedAssets all-markdown mode scans beyond entrypoint', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# root\n');
+  zip.file('guide/extra.md', '![g](../assets/guide.png)');
+  zip.file('assets/guide.png', new Uint8Array([9]));
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, entryPoint: 'index.md' }));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const result = await MdzArchiveCore.findOrphanedAssets(raw, { scanMode: 'all-markdown' });
+
+  assert.deepEqual(result.referencedAssetPaths, ['assets/guide.png']);
+  assert.deepEqual(result.orphanedAssetPaths, []);
 });
