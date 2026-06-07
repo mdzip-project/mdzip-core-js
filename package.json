@@ -1,6 +1,6 @@
 {
-  "name": "mdzip-core-js",
-  "version": "1.2.0",
+  "name": "@mdzip/core-js",
+  "version": "1.2.1",
   "description": "Core TypeScript/JavaScript library for MDZip (.mdz): pack, unpack, validate, and resolve entry points.",
   "license": "Apache-2.0",
   "type": "module",
@@ -41,5 +41,8 @@
   "devDependencies": {
     "@types/node": "^22.19.20",
     "typescript": "^5.8.2"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
