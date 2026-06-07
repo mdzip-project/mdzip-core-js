@@ -2,7 +2,7 @@ import JSZip from '@progress/jszip-esm';
 
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.1.0';
-const CORE_LIBRARY_VERSION = '1.1.0';
+const CORE_LIBRARY_VERSION = '1.2.0';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
@@ -204,6 +204,8 @@ export interface MdzPackInputFile {
   path: string;
   /** Browser `File` source for binary/text loading. */
   file?: File;
+  /** Direct binary source when not providing `file`. */
+  data?: ArrayBuffer | Uint8Array | Blob;
   /** Direct text source when not providing `file`. */
   text?: string;
 }
@@ -218,6 +220,8 @@ export interface MdzSelectedFile {
   originalPath: string;
   /** Original `File` input when provided. */
   file?: File;
+  /** In-memory binary content when provided/generated. */
+  data?: ArrayBuffer | Uint8Array | Blob;
   /** In-memory text content when provided/generated. */
   text?: string;
 }
@@ -267,6 +271,11 @@ export interface MdzValidationResult {
   /** Non-fatal advisory findings discovered during validation. */
   warnings: string[];
 }
+
+/**
+ * Compact validation state for UI save/status indicators.
+ */
+export type MdzValidationStatus = 'valid' | 'warning' | 'error';
 
 /**
  * Result object returned by archive mutation operations.
@@ -348,6 +357,150 @@ export interface MdzOrphanedAssetsResult {
   orphanedAssetPaths: string[];
   /** References that could not be counted as valid image asset references. */
   unresolvedReferences: MdzOrphanedAssetReferenceIssue[];
+}
+
+/**
+ * Asset classification used by normalized workspace models.
+ */
+export type MdzWorkspaceAssetKind = 'image' | 'audio' | 'video' | 'font' | 'data' | 'other';
+
+/**
+ * Options for opening an archive as an app-friendly workspace.
+ */
+export interface MdzOpenWorkspaceOptions {
+  /** Include orphaned image analysis in the returned workspace. Defaults to `false`. */
+  includeOrphanedAssetAnalysis?: boolean;
+  /** Scan mode used when orphaned analysis is enabled. Defaults to `entrypoint`. */
+  orphanedAssetScanMode?: 'entrypoint' | 'all-markdown';
+  /** Include lazy `readBytes` and `readDataUri` functions on assets. Defaults to `true`. */
+  includeLazyAssetReaders?: boolean;
+}
+
+/**
+ * One Markdown document in an opened workspace.
+ */
+export interface MdzWorkspaceDocument {
+  /** Archive-relative document path. */
+  path: string;
+  /** Human-readable title for app navigation. */
+  title: string;
+  /** UTF-8 Markdown source text. */
+  text: string;
+  /** True when this document is the resolved archive entry point. */
+  isEntryPoint: boolean;
+}
+
+/**
+ * One non-Markdown, non-manifest asset in an opened workspace.
+ */
+export interface MdzWorkspaceAsset {
+  /** Archive-relative asset path. */
+  path: string;
+  /** Base file name. */
+  fileName: string;
+  /** Asset byte length. */
+  byteSize: number;
+  /** Inferred MIME type. */
+  mimeType: string;
+  /** Broad asset kind inferred from MIME type/extension. */
+  kind: MdzWorkspaceAssetKind;
+  /** True when common browser preview surfaces can display the asset. */
+  isPreviewable: boolean;
+  /** Optional in-memory bytes used by buildWorkspace/import flows. */
+  bytes?: ArrayBuffer | Uint8Array | Blob;
+  /** Lazy byte reader for archives opened through `openWorkspace`. */
+  readBytes?: () => Promise<Uint8Array>;
+  /** Lazy data-URI reader for previewable assets. */
+  readDataUri?: () => Promise<string>;
+}
+
+/**
+ * Normalized archive workspace for app shells and editor hosts.
+ */
+export interface MdzWorkspace {
+  /** Manifest title, or `null` when unavailable. */
+  title: string | null;
+  /** Resolved archive interpretation mode. */
+  mode: MdzManifestMode;
+  /** Parsed manifest when present and valid. */
+  manifest: MdzManifest | null;
+  /** Resolved primary Markdown entry path, or `null` when unresolved. */
+  entryPoint: string | null;
+  /** All Markdown documents in archive path order. */
+  documents: MdzWorkspaceDocument[];
+  /** All non-Markdown, non-manifest assets in archive path order. */
+  assets: MdzWorkspaceAsset[];
+  /** Archive validation summary. */
+  validation: MdzValidationResult;
+  /** Optional orphaned image analysis. */
+  orphanedAssets?: MdzOrphanedAssetsResult;
+}
+
+/**
+ * App-safe manifest metadata fields.
+ */
+export interface MdzManifestEditableMetadata {
+  title?: string | null;
+  author?: MdzManifestAuthor | string | null;
+  description?: string | null;
+  keywords?: string[] | null;
+  language?: string | null;
+  license?: string | null;
+  version?: string | null;
+  cover?: string | null;
+}
+
+/**
+ * Spec-managed manifest fields apps should normally avoid free-form editing.
+ */
+export interface MdzManifestReservedFields {
+  spec?: MdzManifestSpec;
+  producer?: MdzManifestProducer;
+  created?: string | MdzManifestTimestampObject;
+  modified?: string | MdzManifestTimestampObject;
+  entryPoint?: string | null;
+  mode?: MdzManifestMode;
+  files?: MdzManifestFileMapEntry[];
+}
+
+/**
+ * Options for canonical manifest creation and updates.
+ */
+export interface MdzManifestUpdateOptions {
+  /** Set `created` when creating a new manifest. Defaults to `true`. */
+  setCreatedIfMissing?: boolean;
+  /** Refresh `modified`. Defaults to `true`. */
+  refreshModified?: boolean;
+}
+
+/**
+ * Options for building an archive from a normalized workspace.
+ */
+export interface MdzBuildWorkspaceOptions {
+  /** Fallback root/source label. Defaults to workspace title or `MDZip Workspace`. */
+  rootName?: string;
+  /** Optional manifest metadata updates applied before packaging. */
+  metadata?: MdzManifestEditableMetadata;
+  /** Optional title override. */
+  title?: string | null;
+  /** Optional mode override. */
+  mode?: MdzManifestMode | null;
+  /** Optional entry point override. */
+  entryPoint?: string | null;
+}
+
+/**
+ * Generic archive path tree node for navigation UIs.
+ */
+export interface MdzPathTreeNode {
+  /** Node display name. */
+  name: string;
+  /** Archive-relative path. */
+  path: string;
+  /** True for inferred folder nodes. */
+  isDirectory: boolean;
+  /** Child nodes for directory entries. */
+  children: MdzPathTreeNode[];
 }
 
 /**
@@ -570,6 +723,22 @@ export class MdzArchiveCore {
     return archive.findOrphanedAssets(options);
   }
 
+  /**
+   * Opens archive binary data and returns an app-friendly normalized workspace model.
+   *
+   * @param input - Raw archive bytes.
+   * @param options - Workspace open controls.
+   * @param zipFactory - Optional custom zip loader.
+   */
+  public static async openWorkspace(
+    input: MdzCoreArchiveBinary,
+    options?: MdzOpenWorkspaceOptions,
+    zipFactory?: ZipFactoryLike
+  ): Promise<MdzWorkspace> {
+    const archive = await MdzArchiveCore.open(input, zipFactory);
+    return archive.openWorkspace(options);
+  }
+
   private static getDefaultZipFactory(): ZipFactoryLike {
     return {
       async loadAsync(data: MdzCoreArchiveBinary): Promise<ZipLike> {
@@ -600,6 +769,151 @@ export class MdzArchiveCore {
    */
   public static isMarkdownFile(path: string): boolean {
     return /\.(md|markdown)$/i.test(path);
+  }
+
+  /**
+   * Infers a MIME type from an archive path.
+   *
+   * @param path - Archive-relative path.
+   * @param fallbackMime - MIME type used when extension is unknown.
+   */
+  public static inferMimeType(path: string, fallbackMime = 'application/octet-stream'): string {
+    const ext = MdzArchiveCore.getPathExtension(path);
+    const known: Record<string, string> = {
+      ...MDZ_IMAGE_MIME_TYPES,
+      mp3: 'audio/mpeg',
+      wav: 'audio/wav',
+      ogg: 'audio/ogg',
+      m4a: 'audio/mp4',
+      mp4: 'video/mp4',
+      webm: 'video/webm',
+      mov: 'video/quicktime',
+      woff: 'font/woff',
+      woff2: 'font/woff2',
+      ttf: 'font/ttf',
+      otf: 'font/otf',
+      json: 'application/json',
+      csv: 'text/csv',
+      txt: 'text/plain',
+      css: 'text/css',
+      html: 'text/html',
+      htm: 'text/html',
+      xml: 'application/xml',
+      pdf: 'application/pdf'
+    };
+    return known[ext] ?? fallbackMime;
+  }
+
+  /**
+   * Classifies an asset using path extension and MIME type.
+   *
+   * @param path - Archive-relative path.
+   * @param mimeType - Optional known MIME type.
+   */
+  public static classifyAssetKind(path: string, mimeType = MdzArchiveCore.inferMimeType(path)): MdzWorkspaceAssetKind {
+    if (mimeType.startsWith('image/')) return 'image';
+    if (mimeType.startsWith('audio/')) return 'audio';
+    if (mimeType.startsWith('video/')) return 'video';
+    if (mimeType.startsWith('font/')) return 'font';
+    if (/^(application\/json|text\/csv|text\/plain|text\/css|text\/html|application\/xml|text\/xml)$/.test(mimeType)) return 'data';
+    return 'other';
+  }
+
+  /**
+   * Returns true when common browser surfaces can preview this asset.
+   *
+   * @param path - Archive-relative path.
+   * @param mimeType - Optional known MIME type.
+   */
+  public static isPreviewableAsset(path: string, mimeType = MdzArchiveCore.inferMimeType(path)): boolean {
+    return mimeType.startsWith('image/') || /^(application\/json|text\/csv|text\/plain|text\/css|text\/html|application\/xml|text\/xml)$/.test(mimeType);
+  }
+
+  /**
+   * Converts validation details into a compact status.
+   *
+   * @param result - Validation result.
+   */
+  public static getValidationStatus(result: MdzValidationResult): MdzValidationStatus {
+    if (result.errors.length > 0 || !result.isValid) return 'error';
+    if (result.warnings.length > 0) return 'warning';
+    return 'valid';
+  }
+
+  /**
+   * Returns a case-insensitive, normalized archive path sort.
+   *
+   * @param paths - Archive-relative paths.
+   */
+  public static sortArchivePaths(paths: string[]): string[] {
+    return paths
+      .map(MdzArchiveCore.normalizePath)
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  }
+
+  /**
+   * Returns the archive-relative directory name for a path.
+   *
+   * @param path - Archive-relative path.
+   */
+  public static dirname(path: string): string {
+    const normalized = MdzArchiveCore.normalizePath(path).replace(/\/+$/, '');
+    const slash = normalized.lastIndexOf('/');
+    return slash >= 0 ? normalized.slice(0, slash) : '';
+  }
+
+  /**
+   * Returns the final path segment for an archive-relative path.
+   *
+   * @param path - Archive-relative path.
+   */
+  public static basename(path: string): string {
+    const normalized = MdzArchiveCore.normalizePath(path).replace(/\/+$/, '');
+    const slash = normalized.lastIndexOf('/');
+    return slash >= 0 ? normalized.slice(slash + 1) : normalized;
+  }
+
+  /**
+   * Builds a generic inferred folder tree from archive-relative paths.
+   *
+   * @param paths - Archive-relative paths.
+   */
+  public static buildPathTree(paths: string[]): MdzPathTreeNode[] {
+    const roots: MdzPathTreeNode[] = [];
+
+    const ensureNode = (siblings: MdzPathTreeNode[], name: string, path: string, isDirectory: boolean): MdzPathTreeNode => {
+      let node = siblings.find((item) => item.name.toLowerCase() === name.toLowerCase() && item.isDirectory === isDirectory);
+      if (!node) {
+        node = { name, path, isDirectory, children: [] };
+        siblings.push(node);
+      }
+      return node;
+    };
+
+    for (const archivePath of MdzArchiveCore.sortArchivePaths(paths)) {
+      const parts = archivePath.split('/').filter(Boolean);
+      let siblings = roots;
+      let currentPath = '';
+
+      for (let i = 0; i < parts.length; i += 1) {
+        const part = parts[i] ?? '';
+        currentPath = currentPath ? `${currentPath}/${part}` : part;
+        const isDirectory = i < parts.length - 1;
+        const node = ensureNode(siblings, part, currentPath, isDirectory);
+        siblings = node.children;
+      }
+    }
+
+    const sortNodes = (nodes: MdzPathTreeNode[]): void => {
+      nodes.sort((a, b) => {
+        if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+      });
+      for (const node of nodes) sortNodes(node.children);
+    };
+
+    sortNodes(roots);
+    return roots;
   }
 
   /**
@@ -841,6 +1155,67 @@ export class MdzArchiveCore {
       orphanedAssetPaths,
       unresolvedReferences
     };
+  }
+
+  /**
+   * Returns a normalized app/editor workspace model for this archive.
+   *
+   * @param options - Workspace open controls.
+   */
+  public async openWorkspace(options?: MdzOpenWorkspaceOptions): Promise<MdzWorkspace> {
+    const validation = await this.validate();
+    const manifest = await this.readManifest().catch(() => null);
+    const mode = await this.resolveMode().catch((): MdzManifestMode => 'document');
+    const entryPoint = await this.resolveEntryPoint().catch(() => null);
+    const entries = this.listEntries();
+    const includeLazyReaders = options?.includeLazyAssetReaders !== false;
+
+    const documents: MdzWorkspaceDocument[] = [];
+    for (const entry of entries.filter((item) => item.isMarkdown)) {
+      documents.push({
+        path: entry.path,
+        title: MdzArchiveCore.getDocumentTitle(entry.path, manifest),
+        text: await this.readText(entry.path),
+        isEntryPoint: !!entryPoint && entry.path.toLowerCase() === entryPoint.toLowerCase()
+      });
+    }
+
+    const assets: MdzWorkspaceAsset[] = [];
+    for (const entry of entries.filter((item) => !item.isMarkdown && !item.isDirectory && item.path.toLowerCase() !== 'manifest.json')) {
+      const bytes = await this.readBytes(entry.path);
+      const mimeType = MdzArchiveCore.inferMimeType(entry.path);
+      const asset: MdzWorkspaceAsset = {
+        path: entry.path,
+        fileName: MdzArchiveCore.basename(entry.path),
+        byteSize: bytes.byteLength,
+        mimeType,
+        kind: MdzArchiveCore.classifyAssetKind(entry.path, mimeType),
+        isPreviewable: MdzArchiveCore.isPreviewableAsset(entry.path, mimeType)
+      };
+
+      if (includeLazyReaders) {
+        asset.readBytes = () => this.readBytes(entry.path);
+        asset.readDataUri = () => this.readDataUri(entry.path, mimeType);
+      }
+
+      assets.push(asset);
+    }
+
+    const workspace: MdzWorkspace = {
+      title: manifest?.title ?? null,
+      mode,
+      manifest,
+      entryPoint,
+      documents,
+      assets,
+      validation
+    };
+
+    if (options?.includeOrphanedAssetAnalysis) {
+      workspace.orphanedAssets = await this.findOrphanedAssets({ scanMode: options.orphanedAssetScanMode });
+    }
+
+    return workspace;
   }
 
   public static validateManifest(manifest: unknown): asserts manifest is MdzManifest {
@@ -1187,6 +1562,15 @@ export class MdzArchiveCore {
 
   private static isImagePath(path: string): boolean {
     return MdzArchiveCore.getPathExtension(path) in MDZ_IMAGE_MIME_TYPES;
+  }
+
+  private static getDocumentTitle(path: string, manifest: MdzManifest | null): string {
+    const mapped = manifest?.files?.find((file) => file.path.toLowerCase() === path.toLowerCase());
+    if (mapped?.title?.trim()) return mapped.title.trim();
+
+    const fileName = MdzArchiveCore.basename(path).replace(/\.[^/.]+$/, '');
+    const title = fileName.replace(/[_-]+/g, ' ').trim();
+    return title || path;
   }
 
   private static extractMarkdownImageReferences(markdown: string): string[] {
@@ -1628,6 +2012,193 @@ export class MdzPackagerCore {
     return lines.join('\n');
   }
 
+  /**
+   * Creates a canonical MDZip manifest from app-safe metadata.
+   *
+   * @param metadata - Editable manifest fields.
+   */
+  public static createManifest(metadata?: MdzManifestEditableMetadata & Pick<MdzManifest, 'mode' | 'entryPoint'>): MdzManifest {
+    const now = new Date().toISOString();
+    const author = typeof metadata?.author === 'string' ? { name: metadata.author } : (metadata?.author ?? undefined);
+    return {
+      spec: {
+        name: 'mdzip-spec',
+        version: PRODUCER_SPEC_VERSION
+      },
+      producer: {
+        core: {
+          name: 'mdzip-core-js',
+          version: CORE_LIBRARY_VERSION,
+          url: CORE_LIBRARY_URL
+        }
+      },
+      title: metadata?.title ?? undefined,
+      mode: metadata?.mode ?? undefined,
+      entryPoint: metadata?.entryPoint ?? null,
+      language: metadata?.language ?? 'en',
+      author,
+      authors: author ? [author] : null,
+      description: metadata?.description ?? null,
+      version: metadata?.version ?? null,
+      license: metadata?.license ?? undefined,
+      keywords: metadata?.keywords ?? undefined,
+      cover: metadata?.cover ?? undefined,
+      created: now,
+      modified: now
+    };
+  }
+
+  /**
+   * Updates a manifest while preserving spec-managed fields unless explicitly changed elsewhere.
+   *
+   * @param manifest - Existing manifest, or `null` to create one.
+   * @param updates - Editable metadata updates.
+   * @param options - Timestamp controls.
+   */
+  public static updateManifest(
+    manifest: MdzManifest | null,
+    updates?: MdzManifestEditableMetadata & Partial<Pick<MdzManifest, 'mode' | 'entryPoint'>>,
+    options?: MdzManifestUpdateOptions
+  ): MdzManifest {
+    const next: MdzManifest = manifest ? { ...manifest } : MdzPackagerCore.createManifest(updates);
+    MdzPackagerCore.ensureCanonicalManifest(next, options);
+
+    if (updates) {
+      if ('title' in updates) next.title = updates.title ?? undefined;
+      if ('author' in updates) {
+        const author = typeof updates.author === 'string' ? { name: updates.author } : (updates.author ?? undefined);
+        next.author = author;
+        next.authors = author ? [author] : null;
+      }
+      if ('description' in updates) next.description = updates.description ?? null;
+      if ('keywords' in updates) next.keywords = updates.keywords ?? undefined;
+      if ('language' in updates) next.language = updates.language ?? null;
+      if ('license' in updates) next.license = updates.license ?? undefined;
+      if ('version' in updates) next.version = updates.version ?? null;
+      if ('cover' in updates) next.cover = updates.cover ?? undefined;
+      if ('mode' in updates) next.mode = updates.mode ?? undefined;
+      if ('entryPoint' in updates) next.entryPoint = updates.entryPoint ?? null;
+    }
+
+    MdzPackagerCore.ensureCanonicalManifest(next, options);
+    return next;
+  }
+
+  /**
+   * Splits a manifest into spec-managed fields and ordinary editable metadata.
+   *
+   * @param manifest - Manifest to split.
+   */
+  public static splitManifestMetadata(manifest: MdzManifest): { reserved: MdzManifestReservedFields; editable: MdzManifestEditableMetadata } {
+    return {
+      reserved: {
+        spec: manifest.spec,
+        producer: manifest.producer,
+        created: manifest.created,
+        modified: manifest.modified,
+        entryPoint: manifest.entryPoint,
+        mode: manifest.mode,
+        files: manifest.files
+      },
+      editable: {
+        title: manifest.title ?? null,
+        author: manifest.author ?? null,
+        description: manifest.description ?? null,
+        keywords: manifest.keywords ?? null,
+        language: manifest.language ?? null,
+        license: manifest.license ?? null,
+        version: manifest.version ?? null,
+        cover: manifest.cover ?? null
+      }
+    };
+  }
+
+  /**
+   * Creates a workspace asset from a browser `File`/`Blob` or raw bytes.
+   *
+   * @param source - Asset source.
+   * @param targetPath - Optional archive path override.
+   */
+  public static async createWorkspaceAssetFromFile(source: File | Blob | ArrayBuffer | Uint8Array, targetPath?: string): Promise<MdzWorkspaceAsset> {
+    const isFile = typeof File !== 'undefined' && source instanceof File;
+    const isBlob = typeof Blob !== 'undefined' && source instanceof Blob;
+    const path = MdzPackagerCore.normalizePath(targetPath || (isFile ? source.name : 'asset.bin'));
+    const pathError = MdzPackagerCore.validateArchivePath(path);
+    if (pathError) throw new Error(`ERR_PATH_INVALID: ${pathError}`);
+
+    const bytes = await MdzPackagerCore.readBinarySource(source);
+    const mimeType = isBlob && source.type ? source.type : MdzArchiveCore.inferMimeType(path);
+    return {
+      path,
+      fileName: MdzArchiveCore.basename(path),
+      byteSize: bytes.byteLength,
+      mimeType,
+      kind: MdzArchiveCore.classifyAssetKind(path, mimeType),
+      isPreviewable: MdzArchiveCore.isPreviewableAsset(path, mimeType),
+      bytes
+    };
+  }
+
+  /**
+   * Exports a workspace asset as a browser-safe `Blob`.
+   *
+   * @param asset - Workspace asset.
+   */
+  public static async exportWorkspaceAsset(asset: MdzWorkspaceAsset): Promise<Blob> {
+    const bytes = await MdzPackagerCore.readWorkspaceAssetBytes(asset);
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    return new Blob([buffer], { type: asset.mimeType || MdzArchiveCore.inferMimeType(asset.path) });
+  }
+
+  /**
+   * Builds an `.mdz` archive from a normalized workspace.
+   *
+   * @param workspace - Workspace model.
+   * @param options - Build controls and metadata overrides.
+   * @param zipWriterFactory - Optional custom zip writer.
+   */
+  public static async buildWorkspace(
+    workspace: MdzWorkspace,
+    options?: MdzBuildWorkspaceOptions,
+    zipWriterFactory?: ZipWriterFactoryLike
+  ): Promise<MdzPackBuildResult> {
+    const entryPoint = options?.entryPoint ?? workspace.entryPoint ?? workspace.documents.find((doc) => doc.isEntryPoint)?.path ?? workspace.documents[0]?.path ?? null;
+    const mode = options?.mode ?? workspace.mode;
+    const title = options?.title ?? workspace.title ?? workspace.manifest?.title ?? null;
+    const manifest = MdzPackagerCore.updateManifest(workspace.manifest, {
+      ...(options?.metadata ?? {}),
+      title,
+      mode,
+      entryPoint
+    });
+
+    const files: MdzPackInputFile[] = [
+      ...workspace.documents.map((document) => ({
+        path: document.path,
+        text: document.text
+      })),
+      ...(await Promise.all(workspace.assets.map(async (asset) => ({
+        path: asset.path,
+        data: await MdzPackagerCore.readWorkspaceAssetBytes(asset)
+      })))),
+      {
+        path: 'manifest.json',
+        text: JSON.stringify(manifest, null, 2)
+      }
+    ];
+
+    return MdzPackagerCore.buildArchive(
+      files,
+      options?.rootName || title || 'MDZip Workspace',
+      {
+        createIndex: false,
+        mapFiles: false,
+        filters: ['**/*', '*']
+      },
+      zipWriterFactory
+    );
+  }
+
   private static normalizeLf(content: string): string {
     return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   }
@@ -1652,6 +2223,48 @@ export class MdzPackagerCore {
     return manifest as MdzManifest;
   }
 
+  private static ensureCanonicalManifest(manifest: MdzManifest, options?: MdzManifestUpdateOptions): void {
+    const now = new Date().toISOString();
+    manifest.spec = {
+      ...(manifest.spec ?? {}),
+      name: manifest.spec?.name || 'mdzip-spec',
+      version: manifest.spec?.version || PRODUCER_SPEC_VERSION
+    };
+    manifest.producer = {
+      ...(manifest.producer ?? {}),
+      core: {
+        ...(manifest.producer?.core ?? {}),
+        name: manifest.producer?.core?.name || 'mdzip-core-js',
+        version: manifest.producer?.core?.version || CORE_LIBRARY_VERSION,
+        url: manifest.producer?.core?.url || CORE_LIBRARY_URL
+      }
+    };
+    if (options?.setCreatedIfMissing !== false && manifest.created == null) {
+      manifest.created = now;
+    }
+    if (options?.refreshModified !== false) {
+      const modified = manifest.modified;
+      if (modified && typeof modified === 'object' && !Array.isArray(modified)) {
+        manifest.modified = { ...modified, when: now };
+      } else {
+        manifest.modified = now;
+      }
+    }
+  }
+
+  private static async readBinarySource(source: File | Blob | ArrayBuffer | Uint8Array): Promise<Uint8Array> {
+    if (source instanceof Uint8Array) return source;
+    if (source instanceof ArrayBuffer) return new Uint8Array(source);
+    if (typeof (source as Blob).arrayBuffer === 'function') return new Uint8Array(await (source as Blob).arrayBuffer());
+    throw new Error('ERR_ASSET_BYTES_INVALID: Asset source is not readable as bytes.');
+  }
+
+  private static async readWorkspaceAssetBytes(asset: MdzWorkspaceAsset): Promise<Uint8Array> {
+    if (asset.bytes) return MdzPackagerCore.readBinarySource(asset.bytes);
+    if (asset.readBytes) return asset.readBytes();
+    throw new Error(`ERR_ASSET_BYTES_MISSING: Asset "${asset.path}" has no bytes or readBytes() source.`);
+  }
+
   /**
    * Builds an `.mdz` archive from input files and packaging options.
    *
@@ -1667,7 +2280,7 @@ export class MdzPackagerCore {
     zipWriterFactory?: ZipWriterFactoryLike
   ): Promise<MdzPackBuildResult> {
     const cleanInput = files
-      .map((f) => ({ path: MdzPackagerCore.normalizePath(f.path), file: f.file, text: f.text }))
+      .map((f) => ({ path: MdzPackagerCore.normalizePath(f.path), file: f.file, data: f.data, text: f.text }))
       .filter((f) => f.path && !f.path.endsWith('/'));
 
     if (!cleanInput.length) {
@@ -1716,6 +2329,7 @@ export class MdzPackagerCore {
 
       const selectedItem: MdzSelectedFile = { archivePath, originalPath };
       if (item.file) selectedItem.file = item.file;
+      if (item.data) selectedItem.data = item.data;
       if (item.text != null) selectedItem.text = item.text;
       selected.push(selectedItem);
 
@@ -1771,6 +2385,15 @@ export class MdzPackagerCore {
         } else {
           const buffer = await item.file.arrayBuffer();
           zip.file(item.archivePath, buffer);
+        }
+      } else if (item.data) {
+        if (MdzPackagerCore.isTextFile(item.archivePath)) {
+          const bytes = await MdzPackagerCore.readBinarySource(item.data);
+          const text = new TextDecoder().decode(bytes);
+          zip.file(item.archivePath, MdzPackagerCore.normalizeLf(text));
+        } else {
+          const bytes = await MdzPackagerCore.readBinarySource(item.data);
+          zip.file(item.archivePath, bytes);
         }
       } else {
         const content = item.text || '';

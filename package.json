@@ -1,6 +1,6 @@
 {
   "name": "mdzip-core-js",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Core TypeScript/JavaScript library for MDZip (.mdz): pack, unpack, validate, and resolve entry points.",
   "license": "Apache-2.0",
   "type": "module",
@@ -10,6 +10,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
     }
   },
   "files": [
@@ -19,7 +23,7 @@
     "build": "tsc -p tsconfig.json",
     "clean": "node -e \"import('node:fs').then(fs=>fs.rmSync('dist',{recursive:true,force:true}))\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test tests/spec-conformance.test.mjs"
+    "test": "npm run build && node --test tests/*.test.mjs"
   },
   "keywords": [
     "mdzip",
@@ -35,6 +39,7 @@
     "@progress/jszip-esm": "^1.0.4"
   },
   "devDependencies": {
+    "@types/node": "^22.19.20",
     "typescript": "^5.8.2"
   }
 }

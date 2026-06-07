@@ -241,7 +241,7 @@ test('generated producer manifest includes spec.version', () => {
   assert.ok(manifest);
   assert.equal(manifest.spec.version, '1.1.0');
   assert.equal(manifest.spec.name, 'mdzip-spec');
-  assert.equal(manifest.producer.core.version, '1.1.0');
+  assert.equal(manifest.producer.core.version, '1.2.0');
   assert.equal(manifest.producer.core.url, 'https://github.com/mdzip-project/mdzip-core-js');
   assert.equal(typeof manifest.created, 'string');
   assert.equal(typeof manifest.modified, 'string');
@@ -658,4 +658,108 @@ test('findOrphanedAssets all-markdown mode scans beyond entrypoint', async () =>
 
   assert.deepEqual(result.referencedAssetPaths, ['assets/guide.png']);
   assert.deepEqual(result.orphanedAssetPaths, []);
+});
+
+test('openWorkspace returns documents, assets, validation, and lazy asset readers', async () => {
+  const zip = new JSZip();
+  zip.file('docs/start.md', '# Start\n');
+  zip.file('docs/extra.md', '# Extra\n');
+  zip.file('assets/logo.png', new Uint8Array([1, 2, 3]));
+  zip.file('manifest.json', JSON.stringify({
+    spec: { version: '1.1.0' },
+    title: 'Workspace Sample',
+    mode: 'project',
+    entryPoint: 'docs/start.md',
+    files: [{ path: 'docs/extra.md', originalPath: 'docs/extra.md', title: 'Extra Doc' }]
+  }));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const workspace = await MdzArchiveCore.openWorkspace(raw, { includeOrphanedAssetAnalysis: true });
+
+  assert.equal(workspace.title, 'Workspace Sample');
+  assert.equal(workspace.mode, 'project');
+  assert.equal(workspace.entryPoint, 'docs/start.md');
+  assert.equal(workspace.validation.isValid, true);
+  assert.equal(workspace.documents.length, 2);
+  assert.equal(workspace.documents.find((doc) => doc.path === 'docs/start.md').isEntryPoint, true);
+  assert.equal(workspace.documents.find((doc) => doc.path === 'docs/extra.md').title, 'Extra Doc');
+  assert.equal(workspace.assets.length, 1);
+  assert.equal(workspace.assets[0].path, 'assets/logo.png');
+  assert.equal(workspace.assets[0].byteSize, 3);
+  assert.equal(workspace.assets[0].mimeType, 'image/png');
+  assert.equal(workspace.assets[0].kind, 'image');
+  assert.equal(workspace.assets[0].isPreviewable, true);
+  assert.deepEqual(Array.from(await workspace.assets[0].readBytes()), [1, 2, 3]);
+  assert.equal(await workspace.assets[0].readDataUri(), 'data:image/png;base64,AQID');
+  assert.ok(workspace.orphanedAssets);
+  assert.deepEqual(workspace.orphanedAssets.orphanedAssetPaths, ['assets/logo.png']);
+});
+
+test('buildWorkspace round-trips opened binary assets and applies manifest helpers', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# Old\n');
+  zip.file('assets/logo.png', new Uint8Array([7, 8, 9]));
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, title: 'Old', entryPoint: 'index.md' }));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const workspace = await MdzArchiveCore.openWorkspace(raw);
+  workspace.documents[0].text = '# New\n';
+
+  const result = await MdzPackagerCore.buildWorkspace(workspace, {
+    metadata: {
+      author: 'Ada',
+      description: 'Updated description',
+      keywords: ['sample']
+    },
+    title: 'New Title'
+  });
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
+  const manifest = JSON.parse(await outZip.file('manifest.json').async('text'));
+
+  assert.equal(await outZip.file('index.md').async('text'), '# New\n');
+  assert.deepEqual(Array.from(await outZip.file('assets/logo.png').async('uint8array')), [7, 8, 9]);
+  assert.equal(manifest.title, 'New Title');
+  assert.equal(manifest.author.name, 'Ada');
+  assert.equal(manifest.description, 'Updated description');
+  assert.deepEqual(manifest.keywords, ['sample']);
+  assert.equal(manifest.spec.version, '1.1.0');
+  assert.equal(manifest.producer.core.name, 'mdzip-core-js');
+});
+
+test('workspace asset import/export and manifest metadata helpers work', async () => {
+  const asset = await MdzPackagerCore.createWorkspaceAssetFromFile(new Uint8Array([4, 5]), 'media/data.bin');
+  const blob = await MdzPackagerCore.exportWorkspaceAsset(asset);
+  const manifest = MdzPackagerCore.updateManifest(null, {
+    title: 'Meta',
+    author: { name: 'Author' },
+    language: 'en',
+    cover: 'media/data.bin',
+    mode: 'project',
+    entryPoint: 'index.md'
+  });
+  const split = MdzPackagerCore.splitManifestMetadata(manifest);
+
+  assert.equal(asset.path, 'media/data.bin');
+  assert.equal(asset.byteSize, 2);
+  assert.equal(asset.kind, 'other');
+  assert.deepEqual(Array.from(new Uint8Array(await blob.arrayBuffer())), [4, 5]);
+  assert.equal(split.editable.title, 'Meta');
+  assert.equal(split.reserved.mode, 'project');
+  assert.equal(MdzArchiveCore.getValidationStatus({ isValid: true, errors: [], warnings: [] }), 'valid');
+  assert.equal(MdzArchiveCore.getValidationStatus({ isValid: true, errors: [], warnings: ['warn'] }), 'warning');
+  assert.equal(MdzArchiveCore.getValidationStatus({ isValid: false, errors: ['err'], warnings: [] }), 'error');
+});
+
+test('path utilities sort and build an inferred tree', () => {
+  assert.deepEqual(MdzArchiveCore.sortArchivePaths(['b.md', 'A.md']), ['A.md', 'b.md']);
+  assert.equal(MdzArchiveCore.dirname('docs/start.md'), 'docs');
+  assert.equal(MdzArchiveCore.basename('docs/start.md'), 'start.md');
+
+  const tree = MdzArchiveCore.buildPathTree(['docs/start.md', 'assets/logo.png', 'readme.md']);
+  assert.deepEqual(tree.map((node) => [node.name, node.isDirectory]), [
+    ['assets', true],
+    ['docs', true],
+    ['readme.md', false]
+  ]);
+  assert.equal(tree[0].children[0].path, 'assets/logo.png');
 });
