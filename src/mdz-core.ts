@@ -2382,13 +2382,19 @@ export class MdzPackagerCore {
     const zip = factory.create();
 
     for (const item of selected) {
+      const isImage = MdzPackagerCore.isImagePath(item.archivePath);
       if (item.file) {
         if (MdzPackagerCore.isTextFile(item.archivePath)) {
           const text = await item.file.text();
           zip.file(item.archivePath, MdzPackagerCore.normalizeLf(text));
         } else {
           const buffer = await item.file.arrayBuffer();
-          zip.file(item.archivePath, buffer);
+          // Use STORE (no compression) for images. Vastly faster than DEFLATE with no size penalty.
+          (zip as unknown as { file(path: string, data: unknown, opts?: unknown): unknown }).file(
+            item.archivePath,
+            buffer,
+            isImage ? { compression: 'STORE' } : undefined
+          );
         }
       } else if (item.data) {
         if (MdzPackagerCore.isTextFile(item.archivePath)) {
@@ -2397,14 +2403,22 @@ export class MdzPackagerCore {
           zip.file(item.archivePath, MdzPackagerCore.normalizeLf(text));
         } else {
           const bytes = await MdzPackagerCore.readBinarySource(item.data);
-          zip.file(item.archivePath, bytes);
+          (zip as unknown as { file(path: string, data: unknown, opts?: unknown): unknown }).file(
+            item.archivePath,
+            bytes,
+            isImage ? { compression: 'STORE' } : undefined
+          );
         }
       } else {
         const content = item.text || '';
         if (MdzPackagerCore.isTextFile(item.archivePath)) {
           zip.file(item.archivePath, MdzPackagerCore.normalizeLf(content));
         } else {
-          zip.file(item.archivePath, content);
+          (zip as unknown as { file(path: string, data: unknown, opts?: unknown): unknown }).file(
+            item.archivePath,
+            content,
+            isImage ? { compression: 'STORE' } : undefined
+          );
         }
       }
     }
