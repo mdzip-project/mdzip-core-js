@@ -2207,6 +2207,10 @@ export class MdzPackagerCore {
     return /\.(md|markdown|json|txt|css|html|htm|xml|svg|yaml|yml|toml)$/i.test(path);
   }
 
+  private static isImagePath(path: string): boolean {
+    return /\.(png|jpg|jpeg|gif|webp|bmp|ico|webm|mp4|mp3|wav|ogg)$/i.test(path);
+  }
+
   private static async readProvidedManifest(selected: MdzSelectedFile[]): Promise<MdzManifest | null> {
     const manifestItem = selected.find((item) => item.archivePath.toLowerCase() === 'manifest.json');
     if (!manifestItem) return null;
