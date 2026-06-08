@@ -2409,7 +2409,9 @@ export class MdzPackagerCore {
       zip.file('manifest.json', JSON.stringify(manifest, null, 2));
     }
 
-    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    // Use compression level 1 for ~4-6x speedup with minimal size impact.
+    // Image assets are already compressed and see negligible savings from higher levels.
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 1 } });
 
     return {
       blob,
