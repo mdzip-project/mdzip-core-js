@@ -2,7 +2,8 @@ import JSZip from '@progress/jszip-esm';
 
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.1.0';
-const CORE_LIBRARY_VERSION = '1.2.0';
+// Must match package.json "version" â€” guarded by a unit test.
+const CORE_LIBRARY_VERSION = '1.3.0';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
@@ -292,6 +293,28 @@ export interface MdzArchiveMutationResult {
 }
 
 /**
+ * One file write applied by {@link MdzArchiveCore.updateFiles}.
+ */
+export interface MdzArchiveWriteSpec {
+  /** Archive-relative entry path. Replaces any existing entry with the same path (case-insensitive). */
+  path: string;
+  /** Entry content. Strings are written as UTF-8 text with normalized line endings for text files. */
+  content: MdzArchiveMutationInput;
+}
+
+/**
+ * Controls for {@link MdzArchiveCore.updateFiles}.
+ */
+export interface MdzUpdateFilesOptions {
+  /**
+   * Replacement manifest object written as `manifest.json` (validated and
+   * timestamp-stamped). When omitted, the archive's existing manifest is
+   * refreshed in place. Ignored when `writes` already targets `manifest.json`.
+   */
+  manifest?: MdzManifest | null;
+}
+
+/**
  * Controls archive path/entry listing output.
  */
 export interface MdzArchiveListOptions {
@@ -374,6 +397,13 @@ export interface MdzOpenWorkspaceOptions {
   orphanedAssetScanMode?: 'entrypoint' | 'all-markdown';
   /** Include lazy `readBytes` and `readDataUri` functions on assets. Defaults to `true`. */
   includeLazyAssetReaders?: boolean;
+  /**
+   * When `true`, non-entry-point documents are opened with `text = ''` and a
+   * `readText` lazy reader instead of being read eagerly. The entry-point document
+   * is always read eagerly so the initial view renders without a round-trip.
+   * Defaults to `false`.
+   */
+  includeLazyDocumentReaders?: boolean;
 }
 
 /**
@@ -384,10 +414,28 @@ export interface MdzWorkspaceDocument {
   path: string;
   /** Human-readable title for app navigation. */
   title: string;
-  /** UTF-8 Markdown source text. */
+  /**
+   * UTF-8 Markdown source text. Empty string when `includeLazyDocumentReaders`
+   * was enabled and this document has not yet been read â€” call `readText()` first.
+   */
   text: string;
   /** True when this document is the resolved archive entry point. */
   isEntryPoint: boolean;
+  /**
+   * Present only when `includeLazyDocumentReaders` is enabled and the document
+   * text has not yet been read eagerly. Consumers should populate `text` from the
+   * result and delete this function so subsequent reads are served from memory.
+   */
+  readText?: () => Promise<string>;
+  /**
+   * True when the document was opened lazily and `text` has not been
+   * materialized yet. Unlike `readText`, this flag survives serialization
+   * boundaries (structured clone, JSON, `postMessage`), so the far side can
+   * distinguish a dropped `readText` closure from a genuinely empty document.
+   * Consumers that materialize `text` should clear this flag together with
+   * `readText`.
+   */
+  isLazy?: boolean;
 }
 
 /**
@@ -576,45 +624,7 @@ export class MdzArchiveCore {
     archiveEntryPath: string,
     content: MdzArchiveMutationInput
   ): Promise<MdzArchiveMutationResult> {
-    const targetPath = MdzPackagerCore.normalizePath(archiveEntryPath);
-    const pathError = MdzArchiveCore.validateArchivePath(targetPath);
-    if (pathError) {
-      throw new Error(`ERR_PATH_INVALID: ${pathError}`);
-    }
-
-    const zip = await MdzArchiveCore.loadZip(input);
-    const targetLower = targetPath.toLowerCase();
-    const archivePaths = MdzArchiveCore.getArchivePaths(zip);
-    const nextArchivePaths = archivePaths.filter((p) => p.toLowerCase() !== targetLower);
-    nextArchivePaths.push(targetPath);
-
-    if (targetLower === 'manifest.json') {
-      const replacement = await MdzArchiveCore.parseManifestObjectContent(content, true);
-      const preparedManifest = MdzArchiveCore.stampManifestObject(replacement, true);
-      MdzArchiveCore.validateManifest(preparedManifest);
-      MdzArchiveCore.ensureCreatableEntryPoint(nextArchivePaths, preparedManifest);
-
-      MdzArchiveCore.removeEntryIgnoreCase(zip, targetPath);
-      zip.file('manifest.json', MdzArchiveCore.normaliseLf(JSON.stringify(preparedManifest, null, 2)));
-      return MdzArchiveCore.finalizeMutation(zip);
-    }
-
-    const existingManifestObject = await MdzArchiveCore.readExistingManifestObject(zip, true);
-    if (existingManifestObject) {
-      MdzArchiveCore.validateManifest(existingManifestObject);
-    }
-    MdzArchiveCore.ensureCreatableEntryPoint(nextArchivePaths, existingManifestObject as MdzManifest | null);
-
-    MdzArchiveCore.removeEntryIgnoreCase(zip, targetPath);
-    await MdzArchiveCore.writeZipEntry(zip, targetPath, content);
-
-    if (existingManifestObject) {
-      const refreshed = MdzArchiveCore.stampManifestObject(existingManifestObject, false);
-      MdzArchiveCore.removeEntryIgnoreCase(zip, 'manifest.json');
-      zip.file('manifest.json', MdzArchiveCore.normaliseLf(JSON.stringify(refreshed, null, 2)));
-    }
-
-    return MdzArchiveCore.finalizeMutation(zip);
+    return MdzArchiveCore.updateFiles(input, [{ path: archiveEntryPath, content }]);
   }
 
   /**
@@ -626,37 +636,7 @@ export class MdzArchiveCore {
    * @param archiveEntryPath - Archive-relative path to remove.
    */
   public static async removeFile(input: MdzCoreArchiveBinary, archiveEntryPath: string): Promise<MdzArchiveMutationResult> {
-    const targetPath = MdzPackagerCore.normalizePath(archiveEntryPath);
-    const pathError = MdzArchiveCore.validateArchivePath(targetPath);
-    if (pathError) {
-      throw new Error(`ERR_PATH_INVALID: ${pathError}`);
-    }
-
-    const zip = await MdzArchiveCore.loadZip(input);
-    const targetLower = targetPath.toLowerCase();
-    const archivePaths = MdzArchiveCore.getArchivePaths(zip);
-    const exists = archivePaths.some((p) => p.toLowerCase() === targetLower);
-    if (!exists) {
-      throw new Error(`ERR_NOT_FOUND: Entry "${targetPath}" was not found in archive.`);
-    }
-
-    const nextArchivePaths = archivePaths.filter((p) => p.toLowerCase() !== targetLower);
-    const existingManifestObject = targetLower === 'manifest.json' ? null : await MdzArchiveCore.readExistingManifestObject(zip, true);
-
-    if (existingManifestObject) {
-      MdzArchiveCore.validateManifest(existingManifestObject);
-    }
-    MdzArchiveCore.ensureCreatableEntryPoint(nextArchivePaths, existingManifestObject as MdzManifest | null);
-
-    MdzArchiveCore.removeEntryIgnoreCase(zip, targetPath);
-
-    if (existingManifestObject) {
-      const refreshed = MdzArchiveCore.stampManifestObject(existingManifestObject, false);
-      MdzArchiveCore.removeEntryIgnoreCase(zip, 'manifest.json');
-      zip.file('manifest.json', MdzArchiveCore.normaliseLf(JSON.stringify(refreshed, null, 2)));
-    }
-
-    return MdzArchiveCore.finalizeMutation(zip);
+    return MdzArchiveCore.updateFiles(input, [], [archiveEntryPath]);
   }
 
   /**
@@ -666,50 +646,438 @@ export class MdzArchiveCore {
    * @param archiveEntryPaths - Archive-relative paths to remove.
    */
   public static async removeFiles(input: MdzCoreArchiveBinary, archiveEntryPaths: string[]): Promise<MdzArchiveMutationResult> {
-    const targets = archiveEntryPaths.map((p) => {
-      const normalized = MdzPackagerCore.normalizePath(p);
-      const pathError = MdzArchiveCore.validateArchivePath(normalized);
+    return MdzArchiveCore.updateFiles(input, [], archiveEntryPaths);
+  }
+
+  /**
+   * Applies multiple entry writes and removals in one mutation, patching the
+   * archive at the byte level.
+   *
+   * Unchanged entries are copied verbatim â€” their compressed data is never
+   * decompressed or recompressed â€” so mutations cost milliseconds instead of
+   * many seconds on a 100MB+ archive. Only new or replaced entries are
+   * compressed. {@link addFile}, {@link removeFile}, and {@link removeFiles}
+   * delegate here. Falls back to a full JSZip rebuild when the source archive
+   * uses features the patcher does not support (ZIP64, encryption, non-UTF-8
+   * names).
+   *
+   * Matches the semantics of the single-entry mutation helpers: paths are
+   * validated, removals must exist, entry-point integrity is enforced, and the
+   * manifest (existing or provided via `options.manifest`) is refreshed and
+   * rewritten.
+   *
+   * @param input - Existing archive bytes.
+   * @param writes - Entries to add or replace.
+   * @param removals - Entry paths to remove.
+   * @param options - Manifest override controls.
+   */
+  public static async updateFiles(
+    input: MdzCoreArchiveBinary,
+    writes: MdzArchiveWriteSpec[],
+    removals: string[] = [],
+    options?: MdzUpdateFilesOptions
+  ): Promise<MdzArchiveMutationResult> {
+    const normalizedWrites = new Map<string, { path: string; content: MdzArchiveMutationInput }>();
+    for (const write of writes) {
+      const path = MdzPackagerCore.normalizePath(write.path);
+      const pathError = MdzArchiveCore.validateArchivePath(path);
       if (pathError) {
         throw new Error(`ERR_PATH_INVALID: ${pathError}`);
       }
-      return normalized;
-    });
-
-    if (targets.length === 0) {
-      const zip = await MdzArchiveCore.loadZip(input);
-      return MdzArchiveCore.finalizeMutation(zip);
+      normalizedWrites.set(path.toLowerCase(), { path, content: write.content });
+    }
+    const normalizedRemovals = new Map<string, string>();
+    for (const removal of removals) {
+      const path = MdzPackagerCore.normalizePath(removal);
+      const pathError = MdzArchiveCore.validateArchivePath(path);
+      if (pathError) {
+        throw new Error(`ERR_PATH_INVALID: ${pathError}`);
+      }
+      normalizedRemovals.delete(path.toLowerCase());
+      normalizedRemovals.set(path.toLowerCase(), path);
+    }
+    for (const lower of normalizedRemovals.keys()) {
+      normalizedWrites.delete(lower);
     }
 
-    const zip = await MdzArchiveCore.loadZip(input);
-    const targetSet = new Set(targets.map((p) => p.toLowerCase()));
-    const archivePaths = MdzArchiveCore.getArchivePaths(zip);
+    const sourceBytes = await MdzArchiveCore.readArchiveInputBytes(input);
+    const archive = await MdzArchiveCore.open(sourceBytes);
+    const existingPaths = archive.listPaths();
+    const existingLower = new Set(existingPaths.map((p) => p.toLowerCase()));
 
-    for (const target of targetSet) {
-      if (!archivePaths.some((p) => p.toLowerCase() === target)) {
-        throw new Error(`ERR_NOT_FOUND: Entry "${target}" was not found in archive.`);
+    for (const [lower, path] of normalizedRemovals) {
+      if (!existingLower.has(lower)) {
+        throw new Error(`ERR_NOT_FOUND: Entry "${path.toLowerCase()}" was not found in archive.`);
       }
     }
 
-    const nextArchivePaths = archivePaths.filter((p) => !targetSet.has(p.toLowerCase()));
-    const removesManifest = targetSet.has('manifest.json');
-    const existingManifestObject = removesManifest ? null : await MdzArchiveCore.readExistingManifestObject(zip, true);
-
-    if (existingManifestObject) {
-      MdzArchiveCore.validateManifest(existingManifestObject);
+    // Resolve the manifest entry to write: explicit write > options.manifest > existing refresh.
+    const manifestWrite = normalizedWrites.get('manifest.json');
+    let manifestObject: Record<string, unknown> | null = null;
+    if (manifestWrite) {
+      manifestObject = MdzArchiveCore.stampManifestObject(
+        await MdzArchiveCore.parseManifestObjectContent(manifestWrite.content, true),
+        true
+      );
+    } else if (options?.manifest) {
+      manifestObject = MdzArchiveCore.stampManifestObject(options.manifest as unknown as Record<string, unknown>, false);
+    } else if (
+      (normalizedWrites.size > 0 || normalizedRemovals.size > 0)
+      && !normalizedRemovals.has('manifest.json')
+      && existingLower.has('manifest.json')
+    ) {
+      const existing = await archive.readManifest();
+      if (existing) {
+        manifestObject = MdzArchiveCore.stampManifestObject(existing as unknown as Record<string, unknown>, false);
+      }
     }
-    MdzArchiveCore.ensureCreatableEntryPoint(nextArchivePaths, existingManifestObject as MdzManifest | null);
-
-    for (const target of targetSet) {
-      MdzArchiveCore.removeEntryIgnoreCase(zip, target);
+    if (manifestObject) {
+      MdzArchiveCore.validateManifest(manifestObject);
+      normalizedWrites.set('manifest.json', {
+        path: 'manifest.json',
+        content: MdzArchiveCore.normaliseLf(JSON.stringify(manifestObject, null, 2))
+      });
     }
 
-    if (existingManifestObject) {
-      const refreshed = MdzArchiveCore.stampManifestObject(existingManifestObject, false);
-      MdzArchiveCore.removeEntryIgnoreCase(zip, 'manifest.json');
-      zip.file('manifest.json', MdzArchiveCore.normaliseLf(JSON.stringify(refreshed, null, 2)));
+    const nextPaths = [
+      ...existingPaths.filter((p) => !normalizedRemovals.has(p.toLowerCase()) && !normalizedWrites.has(p.toLowerCase())),
+      ...[...normalizedWrites.values()].map((w) => w.path)
+    ];
+    MdzArchiveCore.ensureCreatableEntryPoint(nextPaths, manifestObject as MdzManifest | null);
+
+    let patchedBytes: Uint8Array;
+    try {
+      patchedBytes = await MdzArchiveCore.patchArchiveBytes(sourceBytes, normalizedWrites, normalizedRemovals);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith('ERR_ZIP_UNSUPPORTED')) {
+        throw error;
+      }
+      // Source archive uses features the raw patcher cannot copy â€” rebuild via JSZip.
+      const zip = await MdzArchiveCore.loadZip(sourceBytes);
+      for (const path of normalizedRemovals.values()) {
+        MdzArchiveCore.removeEntryIgnoreCase(zip, path);
+      }
+      for (const write of normalizedWrites.values()) {
+        MdzArchiveCore.removeEntryIgnoreCase(zip, write.path);
+        await MdzArchiveCore.writeZipEntry(zip, write.path, write.content);
+      }
+      return MdzArchiveCore.finalizeMutation(zip);
     }
 
-    return MdzArchiveCore.finalizeMutation(zip);
+    const blob = new Blob([patchedBytes as unknown as BlobPart], { type: 'application/zip' });
+    const patched = await MdzArchiveCore.open(patchedBytes);
+    const manifest = await patched.readManifest();
+    const resolvedEntryPoint = await patched.resolveEntryPoint().catch(() => null);
+    return {
+      blob,
+      manifest,
+      resolvedEntryPoint,
+      archivePaths: patched.listPaths()
+    };
+  }
+
+  private static async readArchiveInputBytes(input: MdzCoreArchiveBinary): Promise<Uint8Array> {
+    if (input instanceof Uint8Array) return input;
+    if (input instanceof ArrayBuffer) return new Uint8Array(input);
+    return new Uint8Array(await input.arrayBuffer());
+  }
+
+  /**
+   * Rewrites archive bytes by copying unchanged entries' raw compressed data
+   * and appending freshly compressed data for written entries.
+   *
+   * Throws `ERR_ZIP_UNSUPPORTED` for archives the copier cannot handle
+   * losslessly: ZIP64, encrypted entries, multi-disk archives, and non-UTF-8
+   * entry names.
+   */
+  private static async patchArchiveBytes(
+    source: Uint8Array,
+    writes: Map<string, { path: string; content: MdzArchiveMutationInput }>,
+    removals: Map<string, string>
+  ): Promise<Uint8Array> {
+    const entries = MdzArchiveCore.parseRawZipEntries(source);
+    const view = new DataView(source.buffer, source.byteOffset, source.byteLength);
+
+    interface OutputEntry {
+      nameBytes: Uint8Array;
+      flags: number;
+      method: number;
+      time: number;
+      date: number;
+      crc: number;
+      compressedSize: number;
+      uncompressedSize: number;
+      versionMadeBy: number;
+      versionNeeded: number;
+      intAttr: number;
+      extAttr: number;
+      data: Uint8Array;
+      localOffset: number;
+    }
+    const output: OutputEntry[] = [];
+
+    for (const entry of entries) {
+      const lower = entry.name.toLowerCase();
+      if (removals.has(lower) || writes.has(lower)) {
+        continue;
+      }
+      if (entry.localOffset + 30 > source.length || view.getUint32(entry.localOffset, true) !== 0x04034b50) {
+        throw new Error(`ERR_ZIP_UNSUPPORTED: malformed local header for "${entry.name}"`);
+      }
+      const localNameLen = view.getUint16(entry.localOffset + 26, true);
+      const localExtraLen = view.getUint16(entry.localOffset + 28, true);
+      const dataStart = entry.localOffset + 30 + localNameLen + localExtraLen;
+      if (dataStart + entry.compressedSize > source.length) {
+        throw new Error(`ERR_ZIP_UNSUPPORTED: entry data out of bounds for "${entry.name}"`);
+      }
+      output.push({
+        nameBytes: entry.nameBytes,
+        // Clear bit 3 (trailing data descriptor): sizes are written in the header instead.
+        flags: entry.flags & ~0x0008,
+        method: entry.method,
+        time: entry.time,
+        date: entry.date,
+        crc: entry.crc,
+        compressedSize: entry.compressedSize,
+        uncompressedSize: entry.uncompressedSize,
+        versionMadeBy: entry.versionMadeBy,
+        versionNeeded: entry.versionNeeded,
+        intAttr: entry.intAttr,
+        extAttr: entry.extAttr,
+        data: source.subarray(dataStart, dataStart + entry.compressedSize),
+        localOffset: 0
+      });
+    }
+
+    const { time: dosTime, date: dosDate } = MdzArchiveCore.toDosDateTime(new Date());
+    for (const write of writes.values()) {
+      let bytes: Uint8Array;
+      if (MdzArchiveCore.isTextFile(write.path)) {
+        const text = await MdzArchiveCore.readMutationInputAsText(write.content);
+        bytes = new TextEncoder().encode(MdzArchiveCore.normaliseLf(text));
+      } else {
+        const binary = await MdzArchiveCore.readMutationInputAsBinary(write.content);
+        bytes = binary instanceof Uint8Array ? binary : new Uint8Array(binary);
+      }
+      // Mirror the packer policy: images are stored uncompressed; everything
+      // else is deflated when the platform provides CompressionStream.
+      let method = 0;
+      let data = bytes;
+      if (!MdzArchiveCore.isStoredAssetPath(write.path)) {
+        const deflated = await MdzArchiveCore.deflateRawBytes(bytes);
+        if (deflated && deflated.length < bytes.length) {
+          method = 8;
+          data = deflated;
+        }
+      }
+      output.push({
+        nameBytes: new TextEncoder().encode(write.path),
+        flags: 0x0800, // UTF-8 entry name
+        method,
+        time: dosTime,
+        date: dosDate,
+        crc: MdzArchiveCore.crc32(bytes),
+        compressedSize: data.length,
+        uncompressedSize: bytes.length,
+        versionMadeBy: 20,
+        versionNeeded: 20,
+        intAttr: 0,
+        extAttr: 0,
+        data,
+        localOffset: 0
+      });
+    }
+
+    let localSize = 0;
+    let centralSize = 0;
+    for (const entry of output) {
+      localSize += 30 + entry.nameBytes.length + entry.data.length;
+      centralSize += 46 + entry.nameBytes.length;
+    }
+    const out = new Uint8Array(localSize + centralSize + 22);
+    const outView = new DataView(out.buffer);
+    let cursor = 0;
+
+    for (const entry of output) {
+      entry.localOffset = cursor;
+      outView.setUint32(cursor, 0x04034b50, true);
+      outView.setUint16(cursor + 4, entry.versionNeeded, true);
+      outView.setUint16(cursor + 6, entry.flags, true);
+      outView.setUint16(cursor + 8, entry.method, true);
+      outView.setUint16(cursor + 10, entry.time, true);
+      outView.setUint16(cursor + 12, entry.date, true);
+      outView.setUint32(cursor + 14, entry.crc, true);
+      outView.setUint32(cursor + 18, entry.compressedSize, true);
+      outView.setUint32(cursor + 22, entry.uncompressedSize, true);
+      outView.setUint16(cursor + 26, entry.nameBytes.length, true);
+      outView.setUint16(cursor + 28, 0, true);
+      out.set(entry.nameBytes, cursor + 30);
+      out.set(entry.data, cursor + 30 + entry.nameBytes.length);
+      cursor += 30 + entry.nameBytes.length + entry.data.length;
+    }
+
+    const centralOffset = cursor;
+    for (const entry of output) {
+      outView.setUint32(cursor, 0x02014b50, true);
+      outView.setUint16(cursor + 4, entry.versionMadeBy, true);
+      outView.setUint16(cursor + 6, entry.versionNeeded, true);
+      outView.setUint16(cursor + 8, entry.flags, true);
+      outView.setUint16(cursor + 10, entry.method, true);
+      outView.setUint16(cursor + 12, entry.time, true);
+      outView.setUint16(cursor + 14, entry.date, true);
+      outView.setUint32(cursor + 16, entry.crc, true);
+      outView.setUint32(cursor + 20, entry.compressedSize, true);
+      outView.setUint32(cursor + 24, entry.uncompressedSize, true);
+      outView.setUint16(cursor + 28, entry.nameBytes.length, true);
+      outView.setUint16(cursor + 30, 0, true);
+      outView.setUint16(cursor + 32, 0, true);
+      outView.setUint16(cursor + 34, 0, true);
+      outView.setUint16(cursor + 36, entry.intAttr, true);
+      outView.setUint32(cursor + 38, entry.extAttr, true);
+      outView.setUint32(cursor + 42, entry.localOffset, true);
+      out.set(entry.nameBytes, cursor + 46);
+      cursor += 46 + entry.nameBytes.length;
+    }
+
+    outView.setUint32(cursor, 0x06054b50, true);
+    outView.setUint16(cursor + 4, 0, true);
+    outView.setUint16(cursor + 6, 0, true);
+    outView.setUint16(cursor + 8, output.length, true);
+    outView.setUint16(cursor + 10, output.length, true);
+    outView.setUint32(cursor + 12, centralSize, true);
+    outView.setUint32(cursor + 16, centralOffset, true);
+    outView.setUint16(cursor + 20, 0, true);
+
+    return out;
+  }
+
+  private static parseRawZipEntries(source: Uint8Array): Array<{
+    name: string;
+    nameBytes: Uint8Array;
+    flags: number;
+    method: number;
+    time: number;
+    date: number;
+    crc: number;
+    compressedSize: number;
+    uncompressedSize: number;
+    versionMadeBy: number;
+    versionNeeded: number;
+    intAttr: number;
+    extAttr: number;
+    localOffset: number;
+  }> {
+    const view = new DataView(source.buffer, source.byteOffset, source.byteLength);
+    let eocd = -1;
+    const scanEnd = Math.max(0, source.length - 22 - 0xffff);
+    for (let i = source.length - 22; i >= scanEnd; i--) {
+      if (source[i] === 0x50 && source[i + 1] === 0x4b && source[i + 2] === 0x05 && source[i + 3] === 0x06) {
+        eocd = i;
+        break;
+      }
+    }
+    if (eocd < 0) {
+      throw new Error('ERR_ZIP_UNSUPPORTED: end of central directory not found');
+    }
+    if (view.getUint16(eocd + 4, true) !== 0 || view.getUint16(eocd + 6, true) !== 0) {
+      throw new Error('ERR_ZIP_UNSUPPORTED: multi-disk archives are not supported');
+    }
+    const totalEntries = view.getUint16(eocd + 10, true);
+    const centralSize = view.getUint32(eocd + 12, true);
+    const centralOffset = view.getUint32(eocd + 16, true);
+    if (totalEntries === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) {
+      throw new Error('ERR_ZIP_UNSUPPORTED: ZIP64 archives are not supported');
+    }
+
+    const entries = [];
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    let pos = centralOffset;
+    for (let i = 0; i < totalEntries; i++) {
+      if (pos + 46 > source.length || view.getUint32(pos, true) !== 0x02014b50) {
+        throw new Error('ERR_ZIP_UNSUPPORTED: malformed central directory');
+      }
+      const flags = view.getUint16(pos + 8, true);
+      if ((flags & 0x0001) !== 0) {
+        throw new Error('ERR_ZIP_UNSUPPORTED: encrypted entries are not supported');
+      }
+      const compressedSize = view.getUint32(pos + 20, true);
+      const uncompressedSize = view.getUint32(pos + 24, true);
+      const nameLen = view.getUint16(pos + 28, true);
+      const extraLen = view.getUint16(pos + 30, true);
+      const commentLen = view.getUint16(pos + 32, true);
+      const localOffset = view.getUint32(pos + 42, true);
+      if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff || localOffset === 0xffffffff) {
+        throw new Error('ERR_ZIP_UNSUPPORTED: ZIP64 archives are not supported');
+      }
+      const nameBytes = source.slice(pos + 46, pos + 46 + nameLen);
+      if ((flags & 0x0800) === 0 && nameBytes.some((byte) => byte > 0x7f)) {
+        throw new Error('ERR_ZIP_UNSUPPORTED: non-UTF-8 entry names are not supported');
+      }
+      entries.push({
+        name: MdzArchiveCore.normalizePath(decoder.decode(nameBytes)),
+        nameBytes,
+        flags,
+        method: view.getUint16(pos + 10, true),
+        time: view.getUint16(pos + 12, true),
+        date: view.getUint16(pos + 14, true),
+        crc: view.getUint32(pos + 16, true),
+        compressedSize,
+        uncompressedSize,
+        versionMadeBy: view.getUint16(pos + 4, true),
+        versionNeeded: view.getUint16(pos + 6, true),
+        intAttr: view.getUint16(pos + 36, true),
+        extAttr: view.getUint32(pos + 38, true),
+        localOffset
+      });
+      pos += 46 + nameLen + extraLen + commentLen;
+    }
+    return entries;
+  }
+
+  private static isStoredAssetPath(path: string): boolean {
+    return /\.(png|jpg|jpeg|gif|webp|bmp|ico|webm|mp4|mp3|wav|ogg)$/i.test(path);
+  }
+
+  private static async deflateRawBytes(bytes: Uint8Array): Promise<Uint8Array | null> {
+    if (typeof CompressionStream === 'undefined') {
+      return null;
+    }
+    try {
+      const stream = new Blob([bytes as unknown as BlobPart]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch {
+      return null;
+    }
+  }
+
+  private static crc32Table: Uint32Array | null = null;
+
+  private static crc32(bytes: Uint8Array): number {
+    if (!MdzArchiveCore.crc32Table) {
+      const table = new Uint32Array(256);
+      for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) {
+          c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        }
+        table[i] = c >>> 0;
+      }
+      MdzArchiveCore.crc32Table = table;
+    }
+    const table = MdzArchiveCore.crc32Table;
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) {
+      crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  private static toDosDateTime(date: Date): { time: number; date: number } {
+    const year = Math.max(1980, date.getFullYear());
+    return {
+      time: (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1),
+      date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate()
+    };
   }
 
   /**
@@ -1169,15 +1537,23 @@ export class MdzArchiveCore {
     const entryPoint = await this.resolveEntryPoint().catch(() => null);
     const entries = this.listEntries();
     const includeLazyReaders = options?.includeLazyAssetReaders !== false;
+    const includeLazyDocReaders = options?.includeLazyDocumentReaders === true;
 
     const documents: MdzWorkspaceDocument[] = [];
     for (const entry of entries.filter((item) => item.isMarkdown)) {
-      documents.push({
+      const isEntryPt = !!entryPoint && entry.path.toLowerCase() === entryPoint.toLowerCase();
+      const useLazy = includeLazyDocReaders && !isEntryPt;
+      const doc: MdzWorkspaceDocument = {
         path: entry.path,
         title: MdzArchiveCore.getDocumentTitle(entry.path, manifest),
-        text: await this.readText(entry.path),
-        isEntryPoint: !!entryPoint && entry.path.toLowerCase() === entryPoint.toLowerCase()
-      });
+        text: useLazy ? '' : await this.readText(entry.path),
+        isEntryPoint: isEntryPt
+      };
+      if (useLazy) {
+        doc.readText = () => this.readText(entry.path);
+        doc.isLazy = true;
+      }
+      documents.push(doc);
     }
 
     const assets: MdzWorkspaceAsset[] = [];
@@ -2153,6 +2529,12 @@ export class MdzPackagerCore {
   /**
    * Builds an `.mdz` archive from a normalized workspace.
    *
+   * Documents opened lazily (`includeLazyDocumentReaders`) are resolved via
+   * their `readText()` reader before packing, so unopened documents keep their
+   * content. Throws `ERR_LAZY_TEXT_UNAVAILABLE` when a lazy document has empty
+   * `text` and no `readText` reader (e.g. the closure was dropped by a
+   * serialization boundary), instead of silently writing an empty file.
+   *
    * @param workspace - Workspace model.
    * @param options - Build controls and metadata overrides.
    * @param zipWriterFactory - Optional custom zip writer.
@@ -2173,10 +2555,15 @@ export class MdzPackagerCore {
     });
 
     const files: MdzPackInputFile[] = [
-      ...workspace.documents.map((document) => ({
-        path: document.path,
-        text: document.text
-      })),
+      ...(await Promise.all(workspace.documents.map(async (document) => {
+        let text = document.text;
+        if (!text && document.readText) {
+          text = await document.readText();
+        } else if (!text && document.isLazy) {
+          throw new Error(`ERR_LAZY_TEXT_UNAVAILABLE: document "${document.path}" was opened lazily but has no readText() reader (likely dropped by serialization); building would write an empty file`);
+        }
+        return { path: document.path, text };
+      }))),
       ...(await Promise.all(workspace.assets.map(async (asset) => ({
         path: asset.path,
         data: await MdzPackagerCore.readWorkspaceAssetBytes(asset)

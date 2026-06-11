@@ -230,18 +230,19 @@ test('manifest cover is ignored when it points to a directory entry', async () =
   assert.equal(manifest.cover, undefined);
 });
 
-test('generated producer manifest includes spec.version', () => {
+test('generated producer manifest includes spec.version', async () => {
   const manifest = MdzPackagerCore.buildManifestFromOptions('Sample', {
     createIndex: false,
     mapFiles: false,
     filters: [],
     title: 'Sample'
   });
+  const pkg = JSON.parse(await fs.readFile(path.join(__dirname, '..', 'package.json'), 'utf8'));
 
   assert.ok(manifest);
   assert.equal(manifest.spec.version, '1.1.0');
   assert.equal(manifest.spec.name, 'mdzip-spec');
-  assert.equal(manifest.producer.core.version, '1.2.0');
+  assert.equal(manifest.producer.core.version, pkg.version);
   assert.equal(manifest.producer.core.url, 'https://github.com/mdzip-project/mdzip-core-js');
   assert.equal(typeof manifest.created, 'string');
   assert.equal(typeof manifest.modified, 'string');
@@ -724,6 +725,116 @@ test('buildWorkspace round-trips opened binary assets and applies manifest helpe
   assert.deepEqual(manifest.keywords, ['sample']);
   assert.equal(manifest.spec.version, '1.1.0');
   assert.equal(manifest.producer.core.name, 'mdzip-core-js');
+});
+
+test('buildWorkspace resolves lazy document readers instead of writing empty files', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# Entry\n');
+  zip.file('chapter2.md', '# Chapter 2\n');
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, title: 'Lazy', entryPoint: 'index.md' }));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const workspace = await MdzArchiveCore.openWorkspace(raw, { includeLazyDocumentReaders: true });
+  const lazyDoc = workspace.documents.find((doc) => doc.path === 'chapter2.md');
+  assert.equal(lazyDoc.text, '');
+  assert.equal(lazyDoc.isLazy, true);
+  assert.equal(typeof lazyDoc.readText, 'function');
+
+  const result = await MdzPackagerCore.buildWorkspace(workspace);
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
+
+  assert.equal(await outZip.file('chapter2.md').async('text'), '# Chapter 2\n');
+  assert.equal(await outZip.file('index.md').async('text'), '# Entry\n');
+});
+
+test('buildWorkspace throws when a lazy document lost its readText reader', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# Entry\n');
+  zip.file('chapter2.md', '# Chapter 2\n');
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, title: 'Lazy', entryPoint: 'index.md' }));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const workspace = await MdzArchiveCore.openWorkspace(raw, { includeLazyDocumentReaders: true });
+  const lazyDoc = workspace.documents.find((doc) => doc.path === 'chapter2.md');
+  delete lazyDoc.readText;
+
+  await assert.rejects(() => MdzPackagerCore.buildWorkspace(workspace), /ERR_LAZY_TEXT_UNAVAILABLE/);
+});
+
+async function buildUpdateFilesFixture() {
+  const zip = new JSZip();
+  zip.file('index.md', '# Entry\n');
+  zip.file('chapter2.md', '# Chapter 2\n');
+  zip.file('notes/extra.md', '# Extra\n');
+  zip.file('assets/logo.png', new Uint8Array([1, 2, 3]));
+  zip.file('manifest.json', JSON.stringify({
+    spec: { version: '1.1.0' },
+    title: 'Patch Me',
+    entryPoint: 'index.md',
+    modified: { when: '2020-01-01T00:00:00Z', by: { name: 'Old Bot' } }
+  }));
+  return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+}
+
+test('updateFiles applies writes and removals in one byte-level patch', async () => {
+  const raw = await buildUpdateFilesFixture();
+
+  const result = await MdzArchiveCore.updateFiles(
+    raw,
+    [
+      { path: 'chapter2.md', content: '# Chapter 2 updated\r\nwith crlf\r\n' },
+      { path: 'images/new.png', content: new Uint8Array([9, 8, 7]) }
+    ],
+    ['notes/extra.md']
+  );
+
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
+  assert.equal(await outZip.file('index.md').async('text'), '# Entry\n');
+  assert.equal(await outZip.file('chapter2.md').async('text'), '# Chapter 2 updated\nwith crlf\n');
+  assert.deepEqual(Array.from(await outZip.file('images/new.png').async('uint8array')), [9, 8, 7]);
+  assert.deepEqual(Array.from(await outZip.file('assets/logo.png').async('uint8array')), [1, 2, 3]);
+  assert.equal(outZip.file('notes/extra.md'), null);
+
+  const manifest = JSON.parse(await outZip.file('manifest.json').async('text'));
+  assert.equal(manifest.title, 'Patch Me');
+  assert.notEqual(manifest.modified.when, '2020-01-01T00:00:00Z');
+  assert.equal(manifest.modified.by.name, 'Old Bot');
+
+  assert.equal(result.resolvedEntryPoint, 'index.md');
+  assert.equal(result.archivePaths.includes('images/new.png'), true);
+
+  // The patched archive must remain fully usable through the normal open path.
+  const reopened = await MdzArchiveCore.open(await result.blob.arrayBuffer());
+  assert.equal(await reopened.readText('chapter2.md'), '# Chapter 2 updated\nwith crlf\n');
+});
+
+test('updateFiles enforces removal existence, path validity, and entry-point integrity', async () => {
+  const raw = await buildUpdateFilesFixture();
+
+  await assert.rejects(() => MdzArchiveCore.updateFiles(raw, [], ['missing.md']), /ERR_NOT_FOUND/);
+  await assert.rejects(() => MdzArchiveCore.updateFiles(raw, [{ path: '../evil.md', content: 'x' }]), /ERR_PATH_INVALID/);
+  await assert.rejects(() => MdzArchiveCore.updateFiles(raw, [], ['index.md']), /ERR_ENTRYPOINT_MISSING/);
+});
+
+test('updateFiles writes a provided manifest override', async () => {
+  const raw = await buildUpdateFilesFixture();
+
+  const opened = await MdzArchiveCore.open(raw);
+  const manifest = await opened.readManifest();
+  manifest.title = 'Renamed Via Patch';
+
+  const result = await MdzArchiveCore.updateFiles(raw, [], [], { manifest });
+  const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
+  const written = JSON.parse(await outZip.file('manifest.json').async('text'));
+
+  assert.equal(written.title, 'Renamed Via Patch');
+  assert.equal(result.manifest.title, 'Renamed Via Patch');
+});
+
+test('CORE_LIBRARY_VERSION constant matches package.json version', async () => {
+  const pkg = JSON.parse(await fs.readFile(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const manifest = MdzPackagerCore.updateManifest(null, { title: 'Version Probe' });
+  assert.equal(manifest.producer.core.version, pkg.version);
 });
 
 test('workspace asset import/export and manifest metadata helpers work', async () => {
