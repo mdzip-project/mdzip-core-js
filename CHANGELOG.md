@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.1] - 2026-06-14
+
+### Performance
+- `openWorkspace()` now reads uncompressed asset sizes from ZIP central
+  directory metadata instead of extracting every asset during open.
+- `MdzArchiveEntryInfo.byteSize` exposes that metadata when available while
+  preserving extraction fallback support for custom ZIP loaders.
+
 ## [1.3.0] - 2026-06-11
 
 Consolidates the previously unreleased 1.2.7–1.2.9 working-tree changes and

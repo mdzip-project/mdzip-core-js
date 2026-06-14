@@ -3,7 +3,7 @@ import JSZip from '@progress/jszip-esm';
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.1.0';
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '1.3.0';
+const CORE_LIBRARY_VERSION = '1.3.1';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
@@ -332,6 +332,8 @@ export interface MdzArchiveListOptions {
 export interface MdzArchiveEntryInfo {
   /** Archive-relative path. */
   path: string;
+  /** Uncompressed entry size when available from ZIP metadata. */
+  byteSize?: number;
   /** True when entry extension is Markdown. */
   isMarkdown: boolean;
   /** True when entry extension is known image type. */
@@ -585,7 +587,10 @@ export class MdzArchiveCore {
    *
    * @param zip - Loaded zip-like structure containing archive entries.
    */
-  public constructor(private readonly zip: ZipLike) {}
+  public constructor(
+    private readonly zip: ZipLike,
+    private readonly entryByteSizes = new Map<string, number>()
+  ) {}
 
   /**
    * Opens archive binary data and returns a core archive instance.
@@ -595,8 +600,25 @@ export class MdzArchiveCore {
    */
   public static async open(input: MdzCoreArchiveBinary, zipFactory?: ZipFactoryLike): Promise<MdzArchiveCore> {
     const factory = zipFactory ?? MdzArchiveCore.getDefaultZipFactory();
-    const zip = await factory.loadAsync(input);
-    return new MdzArchiveCore(zip);
+    if (zipFactory) {
+      return new MdzArchiveCore(await factory.loadAsync(input));
+    }
+
+    const bytes = await MdzArchiveCore.readArchiveInputBytes(input);
+    const zip = await factory.loadAsync(bytes);
+    const entryByteSizes = new Map<string, number>();
+    try {
+      for (const entry of MdzArchiveCore.parseRawZipEntries(bytes)) {
+        entryByteSizes.set(entry.name.toLowerCase(), entry.uncompressedSize);
+      }
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith('ERR_ZIP_UNSUPPORTED')) {
+        throw error;
+      }
+      // JSZip may support an archive feature the raw metadata reader does not.
+      // Keep opening it and fall back to reading bytes when size is requested.
+    }
+    return new MdzArchiveCore(zip, entryByteSizes);
   }
 
   /**
@@ -1391,6 +1413,7 @@ export class MdzArchiveCore {
     const entries = MdzArchiveCore.getArchiveEntries(this.zip, options);
     return entries.map((entry) => ({
       path: entry.path,
+      byteSize: this.entryByteSizes.get(entry.path.toLowerCase()),
       isMarkdown: !entry.isDirectory && MdzArchiveCore.isMarkdownFile(entry.path),
       isImage: !entry.isDirectory && MdzArchiveCore.isImagePath(entry.path),
       isDirectory: entry.isDirectory
@@ -1558,12 +1581,11 @@ export class MdzArchiveCore {
 
     const assets: MdzWorkspaceAsset[] = [];
     for (const entry of entries.filter((item) => !item.isMarkdown && !item.isDirectory && item.path.toLowerCase() !== 'manifest.json')) {
-      const bytes = await this.readBytes(entry.path);
       const mimeType = MdzArchiveCore.inferMimeType(entry.path);
       const asset: MdzWorkspaceAsset = {
         path: entry.path,
         fileName: MdzArchiveCore.basename(entry.path),
-        byteSize: bytes.byteLength,
+        byteSize: entry.byteSize ?? (await this.readBytes(entry.path)).byteLength,
         mimeType,
         kind: MdzArchiveCore.classifyAssetKind(entry.path, mimeType),
         isPreviewable: MdzArchiveCore.isPreviewableAsset(entry.path, mimeType)

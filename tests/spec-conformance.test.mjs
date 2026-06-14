@@ -696,6 +696,29 @@ test('openWorkspace returns documents, assets, validation, and lazy asset reader
   assert.deepEqual(workspace.orphanedAssets.orphanedAssetPaths, ['assets/logo.png']);
 });
 
+test('openWorkspace obtains asset sizes without extracting asset content', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# Start\n');
+  zip.file('assets/referenced.png', new Uint8Array([1, 2, 3]));
+  zip.file('assets/orphaned.png', new Uint8Array([4, 5, 6, 7]));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+  const archive = await MdzArchiveCore.open(raw);
+  const originalReadBytes = archive.readBytes.bind(archive);
+  const assetReads = [];
+  archive.readBytes = async (path) => {
+    if (path.endsWith('.png')) assetReads.push(path);
+    return originalReadBytes(path);
+  };
+
+  const workspace = await archive.openWorkspace();
+
+  assert.deepEqual(assetReads, []);
+  assert.deepEqual(
+    workspace.assets.map((asset) => [asset.path, asset.byteSize]),
+    [['assets/orphaned.png', 4], ['assets/referenced.png', 3]]
+  );
+});
+
 test('buildWorkspace round-trips opened binary assets and applies manifest helpers', async () => {
   const zip = new JSZip();
   zip.file('index.md', '# Old\n');
