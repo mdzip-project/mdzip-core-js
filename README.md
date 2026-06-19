@@ -1,5 +1,7 @@
 # mdzip-core-js
 
+[![npm](https://img.shields.io/npm/v/@mdzip/core-js)](https://www.npmjs.com/package/@mdzip/core-js)
+
 Core TypeScript/JavaScript library for MDZip (`.mdz`) archives.
 
 Current scope (core only):
