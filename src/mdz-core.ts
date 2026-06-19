@@ -30,7 +30,10 @@ interface ZipLike {
 interface MutableZipLike extends ZipLike {
   file(path: string, data: string | ArrayBuffer | Uint8Array): void;
   remove(path: string): void;
-  generateAsync(options: { type: 'blob'; compression: 'DEFLATE'; compressionOptions: { level: number } }): Promise<Blob>;
+  generateAsync(
+    options: { type: 'blob'; compression: 'DEFLATE'; compressionOptions: { level: number } },
+    onUpdate?: (metadata: MdzZipGenerateMetadata) => void
+  ): Promise<Blob>;
 }
 
 interface ZipFactoryLike {
@@ -39,11 +42,19 @@ interface ZipFactoryLike {
 
 interface ZipWriterLike {
   file(path: string, data: string | ArrayBuffer | Uint8Array): void;
-  generateAsync(options: { type: 'blob'; compression: 'DEFLATE'; compressionOptions: { level: number } }): Promise<Blob>;
+  generateAsync(
+    options: { type: 'blob'; compression: 'DEFLATE'; compressionOptions: { level: number } },
+    onUpdate?: (metadata: MdzZipGenerateMetadata) => void
+  ): Promise<Blob>;
 }
 
 interface ZipWriterFactoryLike {
   create(): ZipWriterLike;
+}
+
+interface MdzZipGenerateMetadata {
+  percent: number;
+  currentFile?: string | null;
 }
 
 /**
@@ -172,6 +183,16 @@ export interface MdzManifest {
 }
 
 /**
+ * Best-effort archive generation progress from the underlying ZIP writer.
+ */
+export interface MdzPackProgress {
+  /** Completion percentage reported by the ZIP writer. */
+  percent: number;
+  /** Archive-relative path currently being processed, when available. */
+  currentFile?: string;
+}
+
+/**
  * Packaging options used by {@link MdzPackagerCore.buildArchive}.
  */
 export interface MdzPackOptions {
@@ -195,6 +216,8 @@ export interface MdzPackOptions {
   description?: string | null;
   /** Optional document version field value. */
   docVersion?: string | null;
+  /** Optional callback for compression/archive assembly progress. */
+  onProgress?: (progress: MdzPackProgress) => void;
 }
 
 /**
@@ -2838,7 +2861,16 @@ export class MdzPackagerCore {
 
     // Use compression level 1 for ~4-6x speedup with minimal size impact.
     // Image assets are already compressed and see negligible savings from higher levels.
-    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 1 } });
+    const blob = await zip.generateAsync(
+      { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 1 } },
+      options.onProgress
+        ? (metadata) => {
+          const progress: MdzPackProgress = { percent: metadata.percent };
+          if (metadata.currentFile) progress.currentFile = metadata.currentFile;
+          options.onProgress?.(progress);
+        }
+        : undefined
+    );
 
     return {
       blob,

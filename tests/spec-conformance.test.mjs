@@ -301,6 +301,44 @@ test('buildArchive does not warn when multiple markdown files explicitly use pro
   assert.equal(result.manifest?.mode, 'project');
 });
 
+test('buildArchive forwards compression progress updates', async () => {
+  const progressUpdates = [];
+  let receivedGenerateOptions = null;
+
+  const result = await MdzPackagerCore.buildArchive(
+    [
+      { path: 'index.md', text: '# Hello\n' }
+    ],
+    'Sample',
+    {
+      createIndex: false,
+      mapFiles: false,
+      filters: ['**/*.md'],
+      onProgress: (progress) => progressUpdates.push(progress)
+    },
+    {
+      create() {
+        return {
+          file() {},
+          async generateAsync(options, onUpdate) {
+            receivedGenerateOptions = options;
+            onUpdate?.({ percent: 12.5, currentFile: 'index.md' });
+            onUpdate?.({ percent: 100, currentFile: null });
+            return new Blob(['fake zip']);
+          }
+        };
+      }
+    }
+  );
+
+  assert.ok(result.blob instanceof Blob);
+  assert.equal(receivedGenerateOptions?.compression, 'DEFLATE');
+  assert.deepEqual(progressUpdates, [
+    { percent: 12.5, currentFile: 'index.md' },
+    { percent: 100 }
+  ]);
+});
+
 test('buildArchive honors a valid user-supplied manifest.json', async () => {
   const result = await MdzPackagerCore.buildArchive(
     [
