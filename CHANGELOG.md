@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.2] - 2026-06-19
+
+### Added
+- `MdzPackagerCore.buildArchive()` accepts an optional `onProgress` callback for
+  best-effort archive-generation progress from the underlying ZIP writer, plus a
+  new exported `MdzPackProgress` type (`percent`, optional `currentFile`). Lets
+  hosts surface packing progress for large archives (issue #17).
+
 ## [1.3.1] - 2026-06-14
 
 ### Performance

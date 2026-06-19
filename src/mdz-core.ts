@@ -3,7 +3,7 @@ import JSZip from '@progress/jszip-esm';
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.1.0';
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '1.3.1';
+const CORE_LIBRARY_VERSION = '1.3.2';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
