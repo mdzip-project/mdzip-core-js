@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.3] - 2026-07-03
+
+### Fixed
+- `findOrphanedAssets()` now recognizes images referenced only via raw HTML
+  `<img src>` tags, not just markdown `![]()` syntax, so they're no longer
+  misreported as orphaned.
+
 ## [1.3.2] - 2026-06-19
 
 ### Added

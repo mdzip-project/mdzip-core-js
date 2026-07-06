@@ -685,6 +685,30 @@ test('findOrphanedAssets finds stale image assets with relative references and c
   assert.ok(result.unresolvedReferences.some((r) => r.reason === 'not-asset'));
 });
 
+test('findOrphanedAssets recognizes raw HTML <img> tag references', async () => {
+  const zip = new JSZip();
+  zip.file('docs/start.md', [
+    '<img src="../assets/sized.png" width="200">',
+    "<img src='../assets/single-quoted.png' />",
+    '![md](../assets/markdown.png)'
+  ].join('\n'));
+  zip.file('assets/sized.png', new Uint8Array([1]));
+  zip.file('assets/single-quoted.png', new Uint8Array([2]));
+  zip.file('assets/markdown.png', new Uint8Array([3]));
+  zip.file('assets/orphan.png', new Uint8Array([4]));
+  zip.file('manifest.json', JSON.stringify({ spec: { version: '1.1.0' }, entryPoint: 'docs/start.md' }));
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const result = await MdzArchiveCore.findOrphanedAssets(raw);
+
+  assert.deepEqual(result.referencedAssetPaths, [
+    'assets/markdown.png',
+    'assets/single-quoted.png',
+    'assets/sized.png'
+  ]);
+  assert.deepEqual(result.orphanedAssetPaths, ['assets/orphan.png']);
+});
+
 test('findOrphanedAssets all-markdown mode scans beyond entrypoint', async () => {
   const zip = new JSZip();
   zip.file('index.md', '# root\n');

@@ -3,7 +3,7 @@ import JSZip from '@progress/jszip-esm';
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.1.0';
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '1.3.2';
+const CORE_LIBRARY_VERSION = '1.3.3';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
@@ -602,6 +602,7 @@ export class MdzArchiveCore {
   private static readonly SUPPORTED_MODES: readonly MdzManifestMode[] = ['document', 'project'];
   private static readonly SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
   private static readonly MARKDOWN_IMAGE_REF_RE = /!\[[^\]]*\]\(([^)\n]+)\)/g;
+  private static readonly HTML_IMG_SRC_RE = /<img\b[^>]*\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))[^>]*>/gi;
   private static readonly entriesCache = new WeakMap<ZipLike, Record<string, ZipEntry>>();
   private static readonly manifestCache = new WeakMap<ZipLike, MdzManifest | null>();
 
@@ -1520,7 +1521,7 @@ export class MdzArchiveCore {
 
     for (const markdownPath of scannedMarkdownPaths) {
       const markdown = await this.readText(markdownPath);
-      const refs = MdzArchiveCore.extractMarkdownImageReferences(markdown);
+      const refs = MdzArchiveCore.extractImageReferences(markdown);
       for (const ref of refs) {
         if (MdzArchiveCore.hasUriScheme(ref)) {
           unresolvedReferences.push({ sourcePath: markdownPath, reference: ref, reason: 'unsupported-scheme' });
@@ -1994,15 +1995,25 @@ export class MdzArchiveCore {
     return title || path;
   }
 
-  private static extractMarkdownImageReferences(markdown: string): string[] {
+  private static extractImageReferences(markdown: string): string[] {
     const refs: string[] = [];
-    const re = new RegExp(MdzArchiveCore.MARKDOWN_IMAGE_REF_RE.source, 'g');
+    const mdRe = new RegExp(MdzArchiveCore.MARKDOWN_IMAGE_REF_RE.source, 'g');
     let match: RegExpExecArray | null;
-    while ((match = re.exec(markdown)) != null) {
+    while ((match = mdRe.exec(markdown)) != null) {
       const raw = match[1]?.trim();
       if (!raw) continue;
       refs.push(MdzArchiveCore.cleanMarkdownLinkTarget(raw));
     }
+
+    // Raw HTML <img src> tags aren't part of the markdown image syntax above,
+    // but authors use them for sizing/alignment control markdown can't express.
+    const htmlRe = new RegExp(MdzArchiveCore.HTML_IMG_SRC_RE.source, 'gi');
+    while ((match = htmlRe.exec(markdown)) != null) {
+      const raw = (match[1] ?? match[2] ?? match[3])?.trim();
+      if (!raw) continue;
+      refs.push(raw);
+    }
+
     return refs;
   }
 
