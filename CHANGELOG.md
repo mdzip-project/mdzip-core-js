@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.4.0] - 2026-08-02
+
+### Added
+- Browser IIFE bundle (`dist/mdzip-core.iife.min.js`, global `MdzipCore`) built
+  with esbuild (`npm run build:browser`), for consumers that need the library
+  outside an ESM bundler pipeline (e.g. a Tampermonkey userscript loading it
+  via `@require` from a CDN). Same public API as the ESM `dist/index.js`
+  entry; no changes to existing exports or consumers.
+
 ## [1.3.3] - 2026-07-03
 
 ### Fixed
