@@ -606,14 +606,19 @@ export class MdzArchiveCore {
   private static readonly entriesCache = new WeakMap<ZipLike, Record<string, ZipEntry>>();
   private static readonly manifestCache = new WeakMap<ZipLike, MdzManifest | null>();
 
+  private entryByteSizes: Map<string, number> | undefined;
+
   /**
    * Creates an archive wrapper around a previously loaded ZIP object.
    *
    * @param zip - Loaded zip-like structure containing archive entries.
+   * @param rawBytes - Original archive bytes, kept to lazily derive per-entry
+   *   uncompressed sizes on first {@link listEntries} call instead of eagerly
+   *   rescanning the central directory on every `open()`.
    */
   public constructor(
     private readonly zip: ZipLike,
-    private readonly entryByteSizes = new Map<string, number>()
+    private readonly rawBytes?: Uint8Array
   ) {}
 
   /**
@@ -630,19 +635,33 @@ export class MdzArchiveCore {
 
     const bytes = await MdzArchiveCore.readArchiveInputBytes(input);
     const zip = await factory.loadAsync(bytes);
-    const entryByteSizes = new Map<string, number>();
-    try {
-      for (const entry of MdzArchiveCore.parseRawZipEntries(bytes)) {
-        entryByteSizes.set(entry.name.toLowerCase(), entry.uncompressedSize);
-      }
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.startsWith('ERR_ZIP_UNSUPPORTED')) {
-        throw error;
-      }
-      // JSZip may support an archive feature the raw metadata reader does not.
-      // Keep opening it and fall back to reading bytes when size is requested.
+    return new MdzArchiveCore(zip, bytes);
+  }
+
+  /**
+   * Lazily derives per-entry uncompressed sizes from the raw archive bytes,
+   * memoizing the result so the central-directory scan runs at most once.
+   */
+  private getEntryByteSizes(): Map<string, number> {
+    if (this.entryByteSizes) {
+      return this.entryByteSizes;
     }
-    return new MdzArchiveCore(zip, entryByteSizes);
+    const entryByteSizes = new Map<string, number>();
+    if (this.rawBytes) {
+      try {
+        for (const entry of MdzArchiveCore.parseRawZipEntries(this.rawBytes)) {
+          entryByteSizes.set(entry.name.toLowerCase(), entry.uncompressedSize);
+        }
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.startsWith('ERR_ZIP_UNSUPPORTED')) {
+          throw error;
+        }
+        // JSZip may support an archive feature the raw metadata reader does not.
+        // Fall back to reading bytes when size is requested (see listEntries()).
+      }
+    }
+    this.entryByteSizes = entryByteSizes;
+    return entryByteSizes;
   }
 
   /**
@@ -1435,9 +1454,10 @@ export class MdzArchiveCore {
    */
   public listEntries(options?: MdzArchiveListOptions): MdzArchiveEntryInfo[] {
     const entries = MdzArchiveCore.getArchiveEntries(this.zip, options);
+    const entryByteSizes = this.getEntryByteSizes();
     return entries.map((entry) => ({
       path: entry.path,
-      byteSize: this.entryByteSizes.get(entry.path.toLowerCase()),
+      byteSize: entryByteSizes.get(entry.path.toLowerCase()),
       isMarkdown: !entry.isDirectory && MdzArchiveCore.isMarkdownFile(entry.path),
       isImage: !entry.isDirectory && MdzArchiveCore.isImagePath(entry.path),
       isDirectory: entry.isDirectory
