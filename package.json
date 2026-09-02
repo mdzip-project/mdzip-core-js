@@ -38,7 +38,8 @@
     "url": "git+https://github.com/mdzip-project/mdzip-core-js.git"
   },
   "dependencies": {
-    "@progress/jszip-esm": "^1.0.4"
+    "@progress/jszip-esm": "^1.0.4",
+    "fflate": "^0.8.3"
   },
   "devDependencies": {
     "@types/node": "^22.19.20",

@@ -709,6 +709,24 @@ test('findOrphanedAssets recognizes raw HTML <img> tag references', async () => 
   assert.deepEqual(result.orphanedAssetPaths, ['assets/orphan.png']);
 });
 
+// Public since this is the one canonical implementation other MDZip packages
+// (@mdzip/editor, mdzip-vscode) are meant to call instead of re-deriving their
+// own copy of these two regexes.
+test('extractImageReferences finds both markdown and raw HTML <img> targets', () => {
+  const markdown = [
+    '![md image](images/a.png)',
+    '<img src="images/b.png" width="200">',
+    "<img src='images/c.png' />",
+    '[not an image](images/d.png)',
+  ].join('\n');
+
+  assert.deepEqual(MdzArchiveCore.extractImageReferences(markdown), [
+    'images/a.png',
+    'images/b.png',
+    'images/c.png',
+  ]);
+});
+
 test('findOrphanedAssets all-markdown mode scans beyond entrypoint', async () => {
   const zip = new JSZip();
   zip.file('index.md', '# root\n');

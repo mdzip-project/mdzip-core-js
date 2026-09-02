@@ -1,4 +1,8 @@
 import JSZip from '@progress/jszip-esm';
+// fflate's `deflateSync`/`inflateSync` are already raw DEFLATE (no zlib/gzip
+// wrapper) — the naming is fflate's own convention, not a mismatch with the
+// 'deflate-raw' this replaces; the wrapped variants are `zlibSync`/`gzipSync`.
+import { deflateSync } from 'fflate';
 
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.1.0';
@@ -925,7 +929,7 @@ export class MdzArchiveCore {
         bytes = binary instanceof Uint8Array ? binary : new Uint8Array(binary);
       }
       // Mirror the packer policy: images are stored uncompressed; everything
-      // else is deflated when the platform provides CompressionStream.
+      // else is deflated (see deflateRawBytes).
       let method = 0;
       let data = bytes;
       if (!MdzArchiveCore.isStoredAssetPath(write.path)) {
@@ -1103,13 +1107,21 @@ export class MdzArchiveCore {
     return /\.(png|jpg|jpeg|gif|webp|bmp|ico|webm|mp4|mp3|wav|ogg)$/i.test(path);
   }
 
+  /**
+   * Was implemented via the browser's native `CompressionStream('deflate-raw')`
+   * (a fresh Blob+stream pipeline per call) until 2026-08-19: in a real VS Code
+   * webview (Electron/Chromium), each call carried a large, apparently fixed
+   * per-invocation overhead (~2+ seconds, confirmed via direct timing) —
+   * invisible in Node/jsdom, where `CompressionStream` doesn't exist and this
+   * silently no-op'd via the `undefined` check this used to have. On an
+   * 11-file archive that added up to ~24 real seconds building a single 88KB
+   * `.mdz`. `fflate`'s `deflateRawSync` is synchronous pure JS (no Streams API,
+   * no per-call environment-specific overhead), works identically in Node and
+   * the browser, and needs no feature-detection fallback.
+   */
   private static async deflateRawBytes(bytes: Uint8Array): Promise<Uint8Array | null> {
-    if (typeof CompressionStream === 'undefined') {
-      return null;
-    }
     try {
-      const stream = new Blob([bytes as unknown as BlobPart]).stream().pipeThrough(new CompressionStream('deflate-raw'));
-      return new Uint8Array(await new Response(stream).arrayBuffer());
+      return deflateSync(bytes);
     } catch {
       return null;
     }
@@ -2015,7 +2027,22 @@ export class MdzArchiveCore {
     return title || path;
   }
 
-  private static extractImageReferences(markdown: string): string[] {
+  /**
+   * Extracts every image reference target found in a block of Markdown text,
+   * from both `![alt](target)` syntax and raw `<img src="target">` HTML tags
+   * (used for sizing/alignment control Markdown syntax can't express).
+   * Targets are returned raw/unresolved — relative to whatever base the
+   * caller's markdown lives at — with surrounding `<...>` wrapping and
+   * Markdown title text (`"..."`/`'...'` after the URL) stripped, but no
+   * further normalization, decoding, or filtering by scheme/existence.
+   *
+   * This is the single canonical implementation other MDZip packages should
+   * call instead of re-deriving their own copy of these two regexes: a
+   * previous fix here (recognizing raw `<img src>` refs, mdzip-editor#24)
+   * only reached this package and `@mdzip/editor`'s own internal copy at the
+   * time, leaving other independent copies elsewhere still `![]()`-only.
+   */
+  static extractImageReferences(markdown: string): string[] {
     const refs: string[] = [];
     const mdRe = new RegExp(MdzArchiveCore.MARKDOWN_IMAGE_REF_RE.source, 'g');
     let match: RegExpExecArray | null;
