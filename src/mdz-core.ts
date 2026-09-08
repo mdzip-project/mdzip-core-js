@@ -7,7 +7,7 @@ import { deflateSync } from 'fflate';
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = '1.1.0';
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '1.4.0';
+const CORE_LIBRARY_VERSION = '1.5.0';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**

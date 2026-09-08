@@ -1,5 +1,31 @@
 # Changelog
 
+## [1.5.0] - 2026-09-07
+
+### Added
+- `MdzArchiveCore.extractImageReferences(markdown)` is now a **public** static
+  method — the single canonical extractor for image targets referenced from a
+  block of Markdown, covering both `![alt](target)` syntax and raw
+  `<img src="target">` tags. Other MDZip packages should call this instead of
+  keeping their own copy of the regexes (a previous raw-`<img src>` fix,
+  mdzip-editor#24, had to be applied in several independent copies). Targets are
+  returned raw and unresolved, with surrounding `<...>` and Markdown title text
+  stripped.
+
+### Changed
+- `MdzArchiveCore.deflateRawBytes()` now compresses with `fflate`
+  (`deflateSync`) instead of the browser's `CompressionStream('deflate-raw')`.
+  In a VS Code webview (Electron/Chromium) each `CompressionStream` call carried
+  a fixed ~2s overhead — invisible under Node/jsdom, where it silently no-op'd —
+  adding up to ~24s to build a single 88KB `.mdz` from an 11-file workspace.
+  `fflate`'s path is synchronous pure JS with no per-call environment overhead
+  and needs no feature detection. Adds `fflate` as a runtime dependency.
+- `MdzArchiveCore` derives per-entry uncompressed sizes lazily on the first
+  `listEntries()` call instead of rescanning the ZIP central directory on every
+  `open()`. The constructor's optional second argument is now the raw archive
+  bytes (`rawBytes`) rather than a precomputed size map; `MdzArchiveCore.open()`
+  — the supported entry point — is unchanged.
+
 ## [1.4.0] - 2026-08-02
 
 ### Added
