@@ -1216,6 +1216,88 @@ export class MdzArchiveCore {
     return /\.(md|markdown)$/i.test(path);
   }
 
+  /** Support file names (spec 1.2.0 §5.5), compared ASCII case-insensitively, with .md or .markdown. */
+  public static readonly SUPPORT_FILE_NAMES: readonly string[] = ['readme', 'agents', 'license', 'changelog', 'contributing'];
+
+  /** Lowercases A–Z only — never locale-aware (spec 1.2.0 §5.4.1; Turkish rules turn LICENSE into lıcense). */
+  public static asciiLower(text: string): string {
+    return String(text).replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+  }
+
+  /**
+   * Returns true for a root-level support file (spec 1.2.0 §5.5): README, AGENTS, LICENSE,
+   * CHANGELOG or CONTRIBUTING, with a .md or .markdown extension. Support files are set aside
+   * when choosing the entry point from root-level Markdown files.
+   */
+  public static isSupportFile(path: string): boolean {
+    if (path.includes('/')) return false;
+    const m = /^(.*)\.(md|markdown)$/.exec(MdzArchiveCore.asciiLower(path));
+    return !!m && MdzArchiveCore.SUPPORT_FILE_NAMES.includes(m[1] ?? '');
+  }
+
+  /** Path equality per spec 1.2.0 §5.4.1: case-sensitive, after Unicode NFC normalization. */
+  public static samePath(a: string, b: string): boolean {
+    return String(a).normalize('NFC') === String(b).normalize('NFC');
+  }
+
+  /**
+   * Why a manifest `entryPoint` value isn't a valid entry point path (spec 1.2.0 §5.5), or null.
+   * Valid: a non-empty string, a relative archive path (§5.4), naming a file (no trailing `/`),
+   * with a .md/.markdown extension. A single leading `./` is allowed.
+   */
+  public static entryPointError(value: unknown): string | null {
+    if (typeof value !== 'string' || value === '') return 'entryPoint must be a non-empty string';
+    const path = value.startsWith('./') ? value.slice(2) : value;
+    if (path.endsWith('/')) return `entryPoint '${value}' names a directory`;
+    const pathError = MdzArchiveCore.validateArchivePath(path);
+    if (pathError) return `entryPoint '${value}' is not a valid archive path (${pathError})`;
+    if (!/\.(md|markdown)$/.test(MdzArchiveCore.asciiLower(path))) return `entryPoint '${value}' is not a .md or .markdown file`;
+    return null;
+  }
+
+  /**
+   * Resolves the entry point per spec 1.2.0 §5.5, throwing a coded error when there is none:
+   *
+   * 1. A manifest `entryPoint`, matched case-sensitively after NFC normalization. An invalid
+   *    value throws `ERR_ENTRYPOINT_INVALID`; a valid one that matches no entry throws
+   *    `ERR_ENTRYPOINT_MISSING`. Neither falls back to the rules below.
+   * 2. `index.md` at the root.
+   * 3. The single root-level Markdown file once support files are set aside; or, if every
+   *    root-level Markdown file is a support file and there is exactly one, that file.
+   * 4. Otherwise `ERR_ENTRYPOINT_UNRESOLVED`.
+   *
+   * @param archivePaths - File paths in the archive (directories are ignored).
+   * @param manifest - Parsed manifest, or null.
+   * @returns The matching path as stored in the archive.
+   */
+  public static resolveEntryPointStrict(archivePaths: readonly string[], manifest?: { entryPoint?: unknown } | null): string {
+    const files = archivePaths.filter((p) => !p.endsWith('/'));
+    const find = (wanted: string) => files.find((p) => MdzArchiveCore.samePath(p, wanted)) ?? null;
+
+    if (manifest && manifest.entryPoint !== undefined && manifest.entryPoint !== null) {
+      const problem = MdzArchiveCore.entryPointError(manifest.entryPoint);
+      if (problem) throw new Error(`ERR_ENTRYPOINT_INVALID: ${problem}`);
+      const value = manifest.entryPoint as string;
+      const found = find(value.startsWith('./') ? value.slice(2) : value);
+      if (!found) throw new Error(`ERR_ENTRYPOINT_MISSING: manifest.json references "${value}" which is not in the archive`);
+      return found;
+    }
+
+    const index = find('index.md');
+    if (index) return index;
+
+    const rootMarkdown = files.filter((p) => !p.includes('/') && MdzArchiveCore.isMarkdownFile(p));
+    const content = rootMarkdown.filter((p) => !MdzArchiveCore.isSupportFile(p));
+    if (content.length === 1) return content[0]!;
+    if (content.length === 0 && rootMarkdown.length === 1) return rootMarkdown[0]!;
+
+    if (rootMarkdown.length === 0) throw new Error('ERR_ENTRYPOINT_UNRESOLVED: No Markdown file found at the archive root.');
+    throw new Error(
+      'ERR_ENTRYPOINT_UNRESOLVED: Multiple Markdown files at the archive root and no manifest.json entryPoint. Add an index.md or manifest.json entryPoint.'
+    );
+  }
+
+
   /**
    * Infers a MIME type from an archive path.
    *
@@ -1753,10 +1835,10 @@ export class MdzArchiveCore {
     }
 
     if (candidate.entryPoint != null && typeof candidate.entryPoint !== 'string') {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json "entryPoint" must be a string when provided.');
+      throw new Error('ERR_ENTRYPOINT_INVALID: manifest.json "entryPoint" must be a string when provided.');
     }
     if (candidate.entryPoint != null && MdzArchiveCore.validateArchivePath(candidate.entryPoint) != null) {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json "entryPoint" must be a valid archive-relative path.');
+      throw new Error('ERR_ENTRYPOINT_INVALID: manifest.json "entryPoint" must be a valid archive-relative path.');
     }
 
     if (candidate.spec != null) {
@@ -1905,10 +1987,6 @@ export class MdzArchiveCore {
           }
         }
 
-        if (manifest.entryPoint && !archivePaths.some((p) => p.toLowerCase() === manifest!.entryPoint!.toLowerCase())) {
-          errors.push(`ERR_ENTRYPOINT_MISSING: manifest 'entryPoint' references '${manifest.entryPoint}' which does not exist in the archive.`);
-        }
-
         const coverCandidate = typeof rawManifest?.cover === 'string' ? rawManifest.cover : manifest.cover;
         if (coverCandidate) {
           const cover = MdzArchiveCore.normalizePath(coverCandidate);
@@ -1945,20 +2023,7 @@ export class MdzArchiveCore {
   public async resolveEntryPoint(): Promise<string> {
     const manifest = await this.readManifest();
     const archivePaths = MdzArchiveCore.getArchivePaths(this.zip);
-
-    if (manifest?.entryPoint && !archivePaths.some((p) => p.toLowerCase() === manifest.entryPoint!.toLowerCase())) {
-      throw new Error(`ERR_ENTRYPOINT_MISSING: manifest.json references "${manifest.entryPoint}" which is not in the archive`);
-    }
-
-    const resolved = MdzPackagerCore.resolveEntryPoint(archivePaths, manifest);
-
-    if (resolved) return resolved;
-
-    const rootMd = archivePaths.filter((p) => !p.includes('/') && MdzArchiveCore.isMarkdownFile(p));
-    if (rootMd.length > 1) {
-      throw new Error('ERR_ENTRYPOINT_UNRESOLVED: Multiple Markdown files at the archive root and no manifest.json entryPoint. Add an index.md or manifest.json entryPoint.');
-    }
-    throw new Error('ERR_ENTRYPOINT_UNRESOLVED: No Markdown file found at the archive root.');
+    return MdzArchiveCore.resolveEntryPointStrict(archivePaths, manifest);
   }
 
   private static getArchivePaths(zip: ZipLike, options?: MdzArchiveListOptions): string[] {
@@ -2181,16 +2246,7 @@ export class MdzArchiveCore {
   }
 
   private static ensureCreatableEntryPoint(archivePaths: string[], manifest?: Pick<MdzManifest, 'entryPoint'> | null): void {
-    if (manifest?.entryPoint && !archivePaths.some((p) => p.toLowerCase() === manifest.entryPoint!.toLowerCase())) {
-      throw new Error(`ERR_ENTRYPOINT_MISSING: manifest 'entryPoint' references '${manifest.entryPoint}' which does not exist in the archive.`);
-    }
-
-    const resolved = MdzPackagerCore.resolveEntryPoint(archivePaths, manifest);
-    if (!resolved) {
-      throw new Error(
-        'ERR_ENTRYPOINT_UNRESOLVED: No unambiguous entry point could be determined. Add index.md at the archive root, keep exactly one root Markdown file, or set manifest.entryPoint.'
-      );
-    }
+    MdzArchiveCore.resolveEntryPointStrict(archivePaths, manifest);
   }
 
   private static async readMutationInputAsText(content: MdzArchiveMutationInput): Promise<string> {
@@ -2450,19 +2506,19 @@ export class MdzPackagerCore {
   }
 
   /**
-   * Resolves entry point using manifest override, `index.md`, or single-root-markdown fallback.
+   * Resolves the entry point per spec 1.2.0 §5.5 (see `MdzArchiveCore.resolveEntryPointStrict`),
+   * returning null instead of throwing when there is none — including when the manifest's
+   * `entryPoint` is invalid or missing, which never falls back to another file.
    *
    * @param archivePaths - Archive file paths.
    * @param manifest - Optional manifest with `entryPoint`.
    */
-  public static resolveEntryPoint(archivePaths: string[], manifest?: Pick<MdzManifest, 'entryPoint'> | null): string | null {
-    if (manifest?.entryPoint && archivePaths.some((p) => p.toLowerCase() === manifest.entryPoint!.toLowerCase())) {
-      return manifest.entryPoint;
+  public static resolveEntryPoint(archivePaths: string[], manifest?: { entryPoint?: unknown } | null): string | null {
+    try {
+      return MdzArchiveCore.resolveEntryPointStrict(archivePaths, manifest);
+    } catch {
+      return null;
     }
-    if (archivePaths.some((p) => p.toLowerCase() === 'index.md')) return 'index.md';
-
-    const rootMarkdown = archivePaths.filter((p) => !p.includes('/') && MdzArchiveCore.isMarkdownFile(p));
-    return rootMarkdown.length === 1 ? (rootMarkdown[0] ?? null) : null;
   }
 
   /**

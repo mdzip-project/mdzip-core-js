@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from '@progress/jszip-esm';
@@ -10,6 +11,18 @@ import { MdzArchiveCore, MdzPackagerCore } from '../dist/index.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const fixturesDir = path.join(__dirname, 'fixtures');
+
+// The fixtures are a copy of mdzip-spec examples/fixtures at a released tag,
+// made by `node ../mdzip-spec/tools/sync-fixtures.mjs tests/fixtures --ref <tag>`.
+// This guards against hand edits and partial updates.
+test('spec fixtures match SPEC-FIXTURES.json', async () => {
+  const marker = JSON.parse(await fs.readFile(path.join(fixturesDir, 'SPEC-FIXTURES.json'), 'utf8'));
+  for (const [name, expected] of Object.entries(marker.files)) {
+    const data = await fs.readFile(path.join(fixturesDir, name));
+    const actual = createHash('sha256').update(data).digest('hex');
+    assert.equal(actual, expected, `${name} differs from spec ${marker.ref}; re-run sync-fixtures.mjs`);
+  }
+});
 
 async function openFixtureArchive(fileName) {
   const raw = await fs.readFile(path.join(fixturesDir, fileName));
