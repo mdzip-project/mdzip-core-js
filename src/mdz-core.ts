@@ -3,11 +3,30 @@ import JSZip from '@progress/jszip-esm';
 // wrapper) — the naming is fflate's own convention, not a mismatch with the
 // 'deflate-raw' this replaces; the wrapped variants are `zlibSync`/`gzipSync`.
 import { deflateSync } from 'fflate';
+import {
+  MDZ_SPEC_VERSION,
+  asciiLower,
+  checkManifest,
+  entryPointProblem,
+  entrySetProblem,
+  isMarkdownPath,
+  isSemver,
+  isSupportFile,
+  mdzError,
+  nfc,
+  parseManifestText,
+  pathProblem,
+  resolveLink,
+  samePath,
+  type MdzLinkHost,
+  type MdzLinkTarget,
+  type MdzLinkUse
+} from './spec.js';
 
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
-const PRODUCER_SPEC_VERSION = '1.1.0';
+const PRODUCER_SPEC_VERSION = MDZ_SPEC_VERSION;
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '1.5.0';
+const CORE_LIBRARY_VERSION = '2.0.0';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
@@ -24,7 +43,15 @@ export type MdzArchiveMutationInput = File | Blob | ArrayBuffer | Uint8Array | s
 interface ZipEntry {
   name: string;
   dir: boolean;
+  /** Unix mode from the external attributes when the entry was made on Unix (JSZip), else null/undefined. */
+  unixPermissions?: number | null;
   async(kind: MdzCoreZipAsyncKind): Promise<string | ArrayBuffer>;
+}
+
+/** True for a symbolic link entry (Unix file type `S_IFLNK` in the external attributes, §4). */
+function isSymlinkEntry(entry: ZipEntry | undefined): boolean {
+  const mode = entry?.unixPermissions;
+  return typeof mode === 'number' && (mode & 0o170000) === 0o120000;
 }
 
 interface ZipLike {
@@ -336,9 +363,18 @@ export interface MdzUpdateFilesOptions {
   /**
    * Replacement manifest object written as `manifest.json` (validated and
    * timestamp-stamped). When omitted, the archive's existing manifest is
-   * refreshed in place. Ignored when `writes` already targets `manifest.json`.
+   * refreshed in place, keeping every field it has (§6.3); an archive with no
+   * manifest gets one. Ignored when `writes` already targets `manifest.json`.
    */
   manifest?: MdzManifest | null;
+  /**
+   * Remove symbolic link entries (see {@link MdzArchiveCore.listSpecialFiles}).
+   * By default they are kept byte-for-byte, so the archive stays as
+   * non-conforming as it was (§4) and `validate()` keeps reporting them; pass
+   * `true` when the user agrees to remove them (§14.1). Writing a file at the
+   * same path also replaces a link.
+   */
+  dropSpecialFiles?: boolean;
 }
 
 /**
@@ -604,11 +640,14 @@ export class MdzArchiveCore {
   public static readonly IMAGE_MIME_TYPES = MDZ_IMAGE_MIME_TYPES;
   private static readonly SUPPORTED_MDZ_MAJOR = 1;
   private static readonly SUPPORTED_MODES: readonly MdzManifestMode[] = ['document', 'project'];
-  private static readonly SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
   private static readonly MARKDOWN_IMAGE_REF_RE = /!\[[^\]]*\]\(([^)\n]+)\)/g;
   private static readonly HTML_IMG_SRC_RE = /<img\b[^>]*\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))[^>]*>/gi;
   private static readonly entriesCache = new WeakMap<ZipLike, Record<string, ZipEntry>>();
   private static readonly manifestCache = new WeakMap<ZipLike, MdzManifest | null>();
+  private static readonly manifestIssuesCache = new WeakMap<
+    ZipLike,
+    { ignoredFields: string[]; duplicateMembers: string[]; missingCover: string | null }
+  >();
 
   private entryByteSizes: Map<string, number> | undefined;
 
@@ -634,12 +673,46 @@ export class MdzArchiveCore {
   public static async open(input: MdzCoreArchiveBinary, zipFactory?: ZipFactoryLike): Promise<MdzArchiveCore> {
     const factory = zipFactory ?? MdzArchiveCore.getDefaultZipFactory();
     if (zipFactory) {
-      return new MdzArchiveCore(await factory.loadAsync(input));
+      const zip = await MdzArchiveCore.loadOrThrowZipInvalid(() => factory.loadAsync(input));
+      MdzArchiveCore.checkEntryNames(Object.keys(zip.files));
+      return new MdzArchiveCore(zip);
     }
 
     const bytes = await MdzArchiveCore.readArchiveInputBytes(input);
-    const zip = await factory.loadAsync(bytes);
+    const zip = await MdzArchiveCore.loadOrThrowZipInvalid(() => factory.loadAsync(bytes));
+    // The raw central directory sees what JSZip hides: exact duplicate names
+    // (JSZip keeps the last) and the compression method of every entry.
+    let names = Object.keys(zip.files);
+    try {
+      const raw = MdzArchiveCore.parseRawZipEntries(bytes);
+      for (const entry of raw) {
+        if (entry.method !== 0 && entry.method !== 8) {
+          throw mdzError('ERR_ZIP_INVALID', `entry '${entry.name}' uses compression method ${entry.method}; MDZip allows 0 (stored) and 8 (DEFLATE) (§4)`);
+        }
+      }
+      names = raw.map((entry) => entry.name);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith('ERR_ZIP_UNSUPPORTED')) throw error;
+    }
+    MdzArchiveCore.checkEntryNames(names);
     return new MdzArchiveCore(zip, bytes);
+  }
+
+  /** Runs a ZIP load, reporting a container JSZip can't read as `ERR_ZIP_INVALID` (§4, §16.5). */
+  private static async loadOrThrowZipInvalid(load: () => Promise<ZipLike>): Promise<ZipLike> {
+    try {
+      return await load();
+    } catch (error) {
+      if (/^ERR_[A-Z_]+:/.test(error instanceof Error ? error.message : '')) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw mdzError('ERR_ZIP_INVALID', `not a readable ZIP archive (${message})`);
+    }
+  }
+
+  /** Rejects NFC-duplicate entries and files that are also directories (§5.4, §13.1): never picks one. */
+  private static checkEntryNames(names: string[]): void {
+    const problem = entrySetProblem(names);
+    if (problem) throw mdzError(problem.code, problem.message);
   }
 
   /**
@@ -654,7 +727,7 @@ export class MdzArchiveCore {
     if (this.rawBytes) {
       try {
         for (const entry of MdzArchiveCore.parseRawZipEntries(this.rawBytes)) {
-          entryByteSizes.set(entry.name.toLowerCase(), entry.uncompressedSize);
+          entryByteSizes.set(nfc(entry.name), entry.uncompressedSize);
         }
       } catch (error) {
         if (!(error instanceof Error) || !error.message.startsWith('ERR_ZIP_UNSUPPORTED')) {
@@ -746,15 +819,24 @@ export class MdzArchiveCore {
     removals: string[] = [],
     options?: MdzUpdateFilesOptions
   ): Promise<MdzArchiveMutationResult> {
+    // Keys are NFC paths (§5.4.1): case-sensitive, so `Index.md` and `index.md` are different entries.
     const normalizedWrites = new Map<string, { path: string; content: MdzArchiveMutationInput }>();
     for (const write of writes) {
-      const path = MdzPackagerCore.normalizePath(write.path);
+      // Producers write NFC paths (§5.4).
+      const path = nfc(MdzPackagerCore.normalizePath(write.path));
       const pathError = MdzArchiveCore.validateArchivePath(path);
       if (pathError) {
         throw new Error(`ERR_PATH_INVALID: ${pathError}`);
       }
-      normalizedWrites.set(path.toLowerCase(), { path, content: write.content });
+      normalizedWrites.set(path, { path, content: write.content });
     }
+
+    const sourceBytes = await MdzArchiveCore.readArchiveInputBytes(input);
+    const archive = await MdzArchiveCore.open(sourceBytes);
+    const existingPaths = archive.listPaths();
+    const removable = [...existingPaths, ...archive.listSpecialFiles()];
+
+    // Removals map an NFC key to the stored name, which must exist (symbolic links included).
     const normalizedRemovals = new Map<string, string>();
     for (const removal of removals) {
       const path = MdzPackagerCore.normalizePath(removal);
@@ -762,46 +844,57 @@ export class MdzArchiveCore {
       if (pathError) {
         throw new Error(`ERR_PATH_INVALID: ${pathError}`);
       }
-      normalizedRemovals.delete(path.toLowerCase());
-      normalizedRemovals.set(path.toLowerCase(), path);
-    }
-    for (const lower of normalizedRemovals.keys()) {
-      normalizedWrites.delete(lower);
-    }
-
-    const sourceBytes = await MdzArchiveCore.readArchiveInputBytes(input);
-    const archive = await MdzArchiveCore.open(sourceBytes);
-    const existingPaths = archive.listPaths();
-    const existingLower = new Set(existingPaths.map((p) => p.toLowerCase()));
-
-    for (const [lower, path] of normalizedRemovals) {
-      if (!existingLower.has(lower)) {
-        throw new Error(`ERR_NOT_FOUND: Entry "${path.toLowerCase()}" was not found in archive.`);
+      const stored = removable.find((p) => samePath(p, path));
+      if (stored === undefined) {
+        throw new Error(`ERR_NOT_FOUND: Entry "${path}" was not found in archive.`);
       }
+      normalizedRemovals.set(nfc(stored), stored);
+    }
+    if (options?.dropSpecialFiles) {
+      for (const stored of archive.listSpecialFiles()) normalizedRemovals.set(nfc(stored), stored);
+    }
+    for (const key of normalizedRemovals.keys()) {
+      normalizedWrites.delete(key);
     }
 
-    // Resolve the manifest entry to write: explicit write > options.manifest > existing refresh.
+    const changing = normalizedWrites.size > 0 || normalizedRemovals.size > 0;
+    const existingManifest = await MdzArchiveCore.readExistingManifestObject(archive.zip, changing);
+    const entryPointBefore = MdzPackagerCore.resolveEntryPoint(existingPaths, existingManifest);
+
+    // Resolve the manifest entry to write: explicit write > options.manifest > existing refresh
+    // > a new manifest for an archive that has none (§14.1).
     const manifestWrite = normalizedWrites.get('manifest.json');
     let manifestObject: Record<string, unknown> | null = null;
+    let explicitManifest = false;
     if (manifestWrite) {
+      explicitManifest = true;
       manifestObject = MdzArchiveCore.stampManifestObject(
         await MdzArchiveCore.parseManifestObjectContent(manifestWrite.content, true),
         true
       );
+      MdzArchiveCore.validateManifest(manifestObject);
     } else if (options?.manifest) {
+      explicitManifest = true;
       manifestObject = MdzArchiveCore.stampManifestObject(options.manifest as unknown as Record<string, unknown>, false);
-    } else if (
-      (normalizedWrites.size > 0 || normalizedRemovals.size > 0)
-      && !normalizedRemovals.has('manifest.json')
-      && existingLower.has('manifest.json')
-    ) {
-      const existing = await archive.readManifest();
-      if (existing) {
-        manifestObject = MdzArchiveCore.stampManifestObject(existing as unknown as Record<string, unknown>, false);
+      MdzArchiveCore.validateManifest(manifestObject);
+    } else if (changing && !normalizedRemovals.has('manifest.json')) {
+      if (existingManifest) {
+        // Kept as read, so unknown fields — and descriptive values this library would
+        // ignore — survive the save (§6.3); only critical fields must be valid.
+        manifestObject = MdzArchiveCore.stampManifestObject(existingManifest, false);
+        checkManifest(manifestObject);
+      } else {
+        manifestObject = MdzArchiveCore.stampManifestObject(
+          {
+            spec: { name: 'mdzip-spec', version: PRODUCER_SPEC_VERSION },
+            producer: { core: { name: 'mdzip-core-js', version: CORE_LIBRARY_VERSION, url: CORE_LIBRARY_URL } },
+            ...(entryPointBefore && !normalizedRemovals.has(nfc(entryPointBefore)) ? { entryPoint: entryPointBefore } : {})
+          },
+          true
+        );
       }
     }
     if (manifestObject) {
-      MdzArchiveCore.validateManifest(manifestObject);
       normalizedWrites.set('manifest.json', {
         path: 'manifest.json',
         content: MdzArchiveCore.normaliseLf(JSON.stringify(manifestObject, null, 2))
@@ -809,10 +902,18 @@ export class MdzArchiveCore {
     }
 
     const nextPaths = [
-      ...existingPaths.filter((p) => !normalizedRemovals.has(p.toLowerCase()) && !normalizedWrites.has(p.toLowerCase())),
+      ...existingPaths.filter((p) => !normalizedRemovals.has(nfc(p)) && !normalizedWrites.has(nfc(p))),
       ...[...normalizedWrites.values()].map((w) => w.path)
     ];
-    MdzArchiveCore.ensureCreatableEntryPoint(nextPaths, manifestObject as MdzManifest | null);
+    const nextManifest = manifestObject ?? (normalizedRemovals.has('manifest.json') ? null : existingManifest);
+    const entryPointAfter = MdzArchiveCore.resolveEntryPointStrict(nextPaths, nextManifest);
+    // A modification must not change which file the entry point resolves to unless the
+    // caller sets it explicitly through the manifest (§14.1).
+    if (entryPointBefore && !explicitManifest && !samePath(entryPointBefore, entryPointAfter)) {
+      throw new Error(
+        `ERR_ENTRYPOINT_CHANGED: this change would move the entry point from "${entryPointBefore}" to "${entryPointAfter}"; set manifest entryPoint to change it.`
+      );
+    }
 
     let patchedBytes: Uint8Array;
     try {
@@ -824,10 +925,10 @@ export class MdzArchiveCore {
       // Source archive uses features the raw patcher cannot copy â€” rebuild via JSZip.
       const zip = await MdzArchiveCore.loadZip(sourceBytes);
       for (const path of normalizedRemovals.values()) {
-        MdzArchiveCore.removeEntryIgnoreCase(zip, path);
+        MdzArchiveCore.removeEntrySamePath(zip, path);
       }
       for (const write of normalizedWrites.values()) {
-        MdzArchiveCore.removeEntryIgnoreCase(zip, write.path);
+        MdzArchiveCore.removeEntrySamePath(zip, write.path);
         await MdzArchiveCore.writeZipEntry(zip, write.path, write.content);
       }
       return MdzArchiveCore.finalizeMutation(zip);
@@ -886,8 +987,8 @@ export class MdzArchiveCore {
     const output: OutputEntry[] = [];
 
     for (const entry of entries) {
-      const lower = entry.name.toLowerCase();
-      if (removals.has(lower) || writes.has(lower)) {
+      const key = nfc(entry.name);
+      if (removals.has(key) || writes.has(key)) {
         continue;
       }
       if (entry.localOffset + 30 > source.length || view.getUint32(entry.localOffset, true) !== 0x04034b50) {
@@ -1213,7 +1314,7 @@ export class MdzArchiveCore {
    * @param path - Archive-relative path.
    */
   public static isMarkdownFile(path: string): boolean {
-    return /\.(md|markdown)$/i.test(path);
+    return isMarkdownPath(path);
   }
 
   /** Support file names (spec 1.2.0 §5.5), compared ASCII case-insensitively, with .md or .markdown. */
@@ -1221,7 +1322,7 @@ export class MdzArchiveCore {
 
   /** Lowercases A–Z only — never locale-aware (spec 1.2.0 §5.4.1; Turkish rules turn LICENSE into lıcense). */
   public static asciiLower(text: string): string {
-    return String(text).replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+    return asciiLower(text);
   }
 
   /**
@@ -1230,14 +1331,12 @@ export class MdzArchiveCore {
    * when choosing the entry point from root-level Markdown files.
    */
   public static isSupportFile(path: string): boolean {
-    if (path.includes('/')) return false;
-    const m = /^(.*)\.(md|markdown)$/.exec(MdzArchiveCore.asciiLower(path));
-    return !!m && MdzArchiveCore.SUPPORT_FILE_NAMES.includes(m[1] ?? '');
+    return isSupportFile(path);
   }
 
   /** Path equality per spec 1.2.0 §5.4.1: case-sensitive, after Unicode NFC normalization. */
   public static samePath(a: string, b: string): boolean {
-    return String(a).normalize('NFC') === String(b).normalize('NFC');
+    return samePath(a, b);
   }
 
   /**
@@ -1246,13 +1345,7 @@ export class MdzArchiveCore {
    * with a .md/.markdown extension. A single leading `./` is allowed.
    */
   public static entryPointError(value: unknown): string | null {
-    if (typeof value !== 'string' || value === '') return 'entryPoint must be a non-empty string';
-    const path = value.startsWith('./') ? value.slice(2) : value;
-    if (path.endsWith('/')) return `entryPoint '${value}' names a directory`;
-    const pathError = MdzArchiveCore.validateArchivePath(path);
-    if (pathError) return `entryPoint '${value}' is not a valid archive path (${pathError})`;
-    if (!/\.(md|markdown)$/.test(MdzArchiveCore.asciiLower(path))) return `entryPoint '${value}' is not a .md or .markdown file`;
-    return null;
+    return entryPointProblem(value);
   }
 
   /**
@@ -1274,7 +1367,8 @@ export class MdzArchiveCore {
     const files = archivePaths.filter((p) => !p.endsWith('/'));
     const find = (wanted: string) => files.find((p) => MdzArchiveCore.samePath(p, wanted)) ?? null;
 
-    if (manifest && manifest.entryPoint !== undefined && manifest.entryPoint !== null) {
+    // `null` is a wrong type, not "absent" (§6.4): only a missing member falls through to rules 2–4.
+    if (manifest && 'entryPoint' in manifest && manifest.entryPoint !== undefined) {
       const problem = MdzArchiveCore.entryPointError(manifest.entryPoint);
       if (problem) throw new Error(`ERR_ENTRYPOINT_INVALID: ${problem}`);
       const value = manifest.entryPoint as string;
@@ -1409,7 +1503,7 @@ export class MdzArchiveCore {
     const roots: MdzPathTreeNode[] = [];
 
     const ensureNode = (siblings: MdzPathTreeNode[], name: string, path: string, isDirectory: boolean): MdzPathTreeNode => {
-      let node = siblings.find((item) => item.name.toLowerCase() === name.toLowerCase() && item.isDirectory === isDirectory);
+      let node = siblings.find((item) => samePath(item.name, name) && item.isDirectory === isDirectory);
       if (!node) {
         node = { name, path, isDirectory, children: [] };
         siblings.push(node);
@@ -1450,19 +1544,26 @@ export class MdzArchiveCore {
    * @returns `null` when valid, otherwise a short reason string.
    */
   public static validateArchivePath(path: string): string | null {
-    const raw = String(path || '');
-    if (!raw) return 'empty path';
-    if (raw.startsWith('/')) return 'leading slash';
-    if (raw.includes('\\')) return 'reserved character';
+    const problem = pathProblem(path);
+    return problem ? (MdzArchiveCore.PATH_PROBLEM_REASONS[problem.code] ?? problem.message) : null;
+  }
 
-    const normalized = raw;
-    if (normalized.split('/').includes('..')) return 'path traversal';
-    for (const c of normalized) {
-      const code = c.charCodeAt(0);
-      if (c === '\0' || (code >= 1 && code <= 31) || code === 127) return 'control char';
-    }
-    if (/[\\:*?"<>|]/.test(normalized)) return 'reserved character';
-    return null;
+  /** Short reasons returned by {@link validateArchivePath}, by spec error code. */
+  private static readonly PATH_PROBLEM_REASONS: Record<string, string> = {
+    ERR_PATH_EMPTY: 'empty path',
+    ERR_PATH_LEADING_SLASH: 'leading slash',
+    ERR_PATH_CONTROL_CHAR: 'control char',
+    ERR_PATH_RESERVED_CHAR: 'reserved character',
+    ERR_PATH_TRAVERSAL: 'path traversal',
+    ERR_PATH_INVALID: 'empty or dot segment'
+  };
+
+  /**
+   * Why `path` isn't a valid archive entry path (§5.4) as a spec error code and message, or null.
+   * A trailing `/` marks a directory entry.
+   */
+  public static pathProblem(path: string): { code: string; message: string } | null {
+    return pathProblem(path);
   }
 
   private static dirOf(filePath: string): string {
@@ -1514,22 +1615,77 @@ export class MdzArchiveCore {
   }
 
   /**
-   * Finds an archive entry by path (case-insensitive fallback).
+   * Finds an archive entry by path: case-sensitive, after Unicode NFC normalization (§5.4.1).
+   * Symbolic link entries are never returned (§13.1); see {@link listSpecialFiles}.
    *
    * @param path - Archive-relative path.
    */
   public findEntry(path: string): ZipEntry | null {
-    const normalized = MdzArchiveCore.normalizePath(path);
-    if (this.zip.files[normalized]) return this.zip.files[normalized];
-
     if (!MdzArchiveCore.entriesCache.has(this.zip)) {
       MdzArchiveCore.entriesCache.set(
         this.zip,
-        Object.fromEntries(Object.entries(this.zip.files).map(([k, v]) => [MdzArchiveCore.normalizePath(k).toLowerCase(), v]))
+        Object.fromEntries(
+          Object.entries(this.zip.files)
+            .filter(([, v]) => !isSymlinkEntry(v))
+            .map(([k, v]) => [nfc(MdzArchiveCore.normalizePath(k)), v])
+        )
       );
     }
 
-    return MdzArchiveCore.entriesCache.get(this.zip)?.[normalized.toLowerCase()] ?? null;
+    return MdzArchiveCore.entriesCache.get(this.zip)?.[nfc(MdzArchiveCore.normalizePath(path))] ?? null;
+  }
+
+  /**
+   * The stored path of an entry whose name differs from `path` only in case, for reporting a
+   * failed lookup ("did you mean ...?", §5.4.1). Never use it to open the entry.
+   *
+   * @param path - Archive-relative path that wasn't found.
+   */
+  public findCaseOnlyMatch(path: string): string | null {
+    const normalized = MdzArchiveCore.normalizePath(path);
+    const wanted = nfc(normalized).toLowerCase();
+    return this.listPaths().find((p) => nfc(p).toLowerCase() === wanted && !samePath(p, normalized)) ?? null;
+  }
+
+  /**
+   * Symbolic link entries (and other special files) in the archive. They are not listed by
+   * {@link listPaths}, can't be read and are never followed (§4, §13.1); `validate()` reports
+   * them. Mutations keep them unless `dropSpecialFiles` is set.
+   */
+  public listSpecialFiles(): string[] {
+    return Object.entries(this.zip.files)
+      .filter(([, entry]) => isSymlinkEntry(entry))
+      .map(([path]) => MdzArchiveCore.normalizePath(path));
+  }
+
+  /**
+   * Resolves a Markdown link written in `document` (§9.3–9.6). Without a `host`, only links inside
+   * this archive resolve; links that leave it are `unresolved` with reason `no-host-location`
+   * (pass a host that knows the archive's location and its neighbours to follow them).
+   *
+   * @param document - Archive path of the document containing the link.
+   * @param link - The link destination as written.
+   * @param host - Optional host model; this archive is addressed as `host` path `archivePath`.
+   * @param options - `archivePath` (this archive's host path, default `archive.mdz`) and `use`.
+   */
+  public resolveLink(
+    document: string,
+    link: string,
+    host?: MdzLinkHost,
+    options?: { archivePath?: string; use?: MdzLinkUse }
+  ): MdzLinkTarget {
+    const archivePath = options?.archivePath ?? 'archive.mdz';
+    const self = this;
+    const linkHost: MdzLinkHost = host ?? {
+      kind: () => null,
+      findEntry: (_archive, entry) => {
+        const found = self.findEntry(entry);
+        return found && !found.dir ? MdzArchiveCore.normalizePath(found.name) : null;
+      },
+      entryPoint: () => null,
+      hostLocation: false
+    };
+    return resolveLink({ archive: archivePath, path: document }, link, linkHost, options?.use ?? 'navigate');
   }
 
   /**
@@ -1551,7 +1707,7 @@ export class MdzArchiveCore {
     const entryByteSizes = this.getEntryByteSizes();
     return entries.map((entry) => ({
       path: entry.path,
-      byteSize: entryByteSizes.get(entry.path.toLowerCase()),
+      byteSize: entryByteSizes.get(nfc(entry.path)),
       isMarkdown: !entry.isDirectory && MdzArchiveCore.isMarkdownFile(entry.path),
       isImage: !entry.isDirectory && MdzArchiveCore.isImagePath(entry.path),
       isDirectory: entry.isDirectory
@@ -1623,7 +1779,7 @@ export class MdzArchiveCore {
       .filter((entry) => entry.isImage)
       .map((entry) => entry.path)
       .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-    const assetPathSet = new Set(assetPaths.map((p) => p.toLowerCase()));
+    const assetPathSet = new Set(assetPaths.map((p) => nfc(p)));
 
     const scanMode = options?.scanMode ?? 'entrypoint';
     const scannedMarkdownPaths = scanMode === 'all-markdown'
@@ -1656,7 +1812,7 @@ export class MdzArchiveCore {
           continue;
         }
 
-        if (!MdzArchiveCore.isImagePath(resolved) || !assetPathSet.has(resolved.toLowerCase())) {
+        if (!MdzArchiveCore.isImagePath(resolved) || !assetPathSet.has(nfc(resolved))) {
           unresolvedReferences.push({ sourcePath: markdownPath, reference: ref, reason: 'not-asset' });
           continue;
         }
@@ -1668,14 +1824,14 @@ export class MdzArchiveCore {
     const manifest = await this.readManifest();
     if (manifest?.cover) {
       const cover = MdzArchiveCore.normalizePath(manifest.cover);
-      if (assetPathSet.has(cover.toLowerCase())) {
-        referencedAssets.add(MdzArchiveCore.resolveAssetPathCase(assetPaths, cover));
+      if (assetPathSet.has(nfc(cover.replace(/^\.\//, '')))) {
+        referencedAssets.add(MdzArchiveCore.resolveAssetPathCase(assetPaths, cover.replace(/^\.\//, '')));
       }
     }
 
     const referencedAssetPaths = Array.from(referencedAssets).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-    const referencedSet = new Set(referencedAssetPaths.map((p) => p.toLowerCase()));
-    const orphanedAssetPaths = assetPaths.filter((p) => !referencedSet.has(p.toLowerCase()));
+    const referencedSet = new Set(referencedAssetPaths.map((p) => nfc(p)));
+    const orphanedAssetPaths = assetPaths.filter((p) => !referencedSet.has(nfc(p)));
 
     return {
       scannedMarkdownPaths,
@@ -1702,7 +1858,7 @@ export class MdzArchiveCore {
 
     const documents: MdzWorkspaceDocument[] = [];
     for (const entry of entries.filter((item) => item.isMarkdown)) {
-      const isEntryPt = !!entryPoint && entry.path.toLowerCase() === entryPoint.toLowerCase();
+      const isEntryPt = !!entryPoint && samePath(entry.path, entryPoint);
       const useLazy = includeLazyDocReaders && !isEntryPt;
       const doc: MdzWorkspaceDocument = {
         path: entry.path,
@@ -1718,7 +1874,7 @@ export class MdzArchiveCore {
     }
 
     const assets: MdzWorkspaceAsset[] = [];
-    for (const entry of entries.filter((item) => !item.isMarkdown && !item.isDirectory && item.path.toLowerCase() !== 'manifest.json')) {
+    for (const entry of entries.filter((item) => !item.isMarkdown && !item.isDirectory && item.path !== 'manifest.json')) {
       const mimeType = MdzArchiveCore.inferMimeType(entry.path);
       const asset: MdzWorkspaceAsset = {
         path: entry.path,
@@ -1754,180 +1910,73 @@ export class MdzArchiveCore {
     return workspace;
   }
 
+  /**
+   * Checks a manifest a producer is about to write (§6.4, §14.1). Critical fields must be valid
+   * (see `checkManifest`), and so must every descriptive field present: a producer must not
+   * write values a consumer would ignore. Unknown fields are never checked. Throws `ERR_*` errors.
+   */
   public static validateManifest(manifest: unknown): asserts manifest is MdzManifest {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
       throw new Error('ERR_MANIFEST_INVALID: manifest.json must be a JSON object.');
     }
+    const ignored = checkManifest(manifest as Record<string, unknown>);
+    MdzArchiveCore.checkLegacyMdzField(manifest as Record<string, unknown>);
+    if (ignored.length) {
+      throw mdzError(
+        'ERR_MANIFEST_INVALID',
+        `manifest.json has invalid values for ${ignored.map((field) => `"${field}"`).join(', ')} (§6.4)`
+      );
+    }
+  }
 
-    const candidate = manifest as MdzManifest;
-
-    const validateMetadataNode = (value: unknown, path: string): void => {
-      if (value == null) return;
-      if (typeof value !== 'object' || Array.isArray(value)) {
-        throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}" must be an object when provided.`);
-      }
-      const node = value as Record<string, unknown>;
-      for (const key of ['name', 'version', 'url']) {
-        const v = node[key];
-        if (v != null && typeof v !== 'string') {
-          throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}.${key}" must be a string when provided.`);
-        }
-      }
-    };
-
-    const validateByNode = (value: unknown, path: string): void => {
-      if (value == null) return;
-      if (typeof value !== 'object' || Array.isArray(value)) {
-        throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}" must be an object when provided.`);
-      }
-      const node = value as Record<string, unknown>;
-      for (const key of ['name', 'email', 'url']) {
-        const v = node[key];
-        if (v != null && typeof v !== 'string') {
-          throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}.${key}" must be a string when provided.`);
-        }
-      }
-    };
-
-    const validateTimestamp = (value: unknown, path: string): void => {
-      if (value == null) return;
-      if (typeof value === 'string') return;
-      if (typeof value !== 'object' || Array.isArray(value)) {
-        throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}" must be a string or object when provided.`);
-      }
-      const node = value as Record<string, unknown>;
-      if (typeof node.when !== 'string' || node.when.trim() === '') {
-        throw new Error(`ERR_MANIFEST_INVALID: manifest.json "${path}.when" must be a non-empty string when "${path}" is an object.`);
-      }
-      validateByNode(node.by, `${path}.by`);
-    };
-
-    if (candidate.title != null && (typeof candidate.title !== 'string' || candidate.title.trim() === '')) {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json "title" must be a non-empty string when provided.');
+  /** The pre-1.0 `mdz` version field: a newer major is still refused; anything else is left alone. */
+  private static checkLegacyMdzField(manifest: Record<string, unknown>): void {
+    const mdz = manifest.mdz;
+    if (isSemver(mdz) && Number.parseInt(mdz, 10) > MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
+      throw mdzError(
+        'ERR_VERSION_UNSUPPORTED',
+        `manifest.json targets mdz ${mdz}, but this library supports major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.x only.`
+      );
     }
-    if (candidate.mode != null) {
-      if (typeof candidate.mode !== 'string') {
-        throw new Error('ERR_MANIFEST_INVALID: manifest.json "mode" must be a string when provided.');
-      }
-      if (!MdzArchiveCore.SUPPORTED_MODES.includes(candidate.mode as MdzManifestMode)) {
-        throw new Error(`ERR_MODE_UNSUPPORTED: manifest.json mode "${candidate.mode}" is not supported.`);
-      }
-    }
-    if (candidate.description != null && typeof candidate.description !== 'string') {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json "description" must be a string when provided.');
-    }
-    if (candidate.version != null && typeof candidate.version !== 'string') {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json "version" must be a string when provided.');
-    }
-    if (candidate.language != null && typeof candidate.language !== 'string') {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json "language" must be a string when provided.');
-    }
-    if (candidate.license != null && typeof candidate.license !== 'string') {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json "license" must be a string when provided.');
-    }
-    if (candidate.keywords != null) {
-      if (!Array.isArray(candidate.keywords) || candidate.keywords.some((k) => typeof k !== 'string')) {
-        throw new Error('ERR_MANIFEST_INVALID: manifest.json "keywords" must be an array of strings when provided.');
-      }
-    }
-    if (candidate.cover != null && typeof candidate.cover !== 'string') {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json "cover" must be a string when provided.');
-    }
-
-    if (candidate.entryPoint != null && typeof candidate.entryPoint !== 'string') {
-      throw new Error('ERR_ENTRYPOINT_INVALID: manifest.json "entryPoint" must be a string when provided.');
-    }
-    if (candidate.entryPoint != null && MdzArchiveCore.validateArchivePath(candidate.entryPoint) != null) {
-      throw new Error('ERR_ENTRYPOINT_INVALID: manifest.json "entryPoint" must be a valid archive-relative path.');
-    }
-
-    if (candidate.spec != null) {
-      if (typeof candidate.spec !== 'object' || Array.isArray(candidate.spec)) {
-        throw new Error('ERR_MANIFEST_INVALID: manifest.json "spec" must be an object when provided.');
-      }
-      const spec = candidate.spec as Record<string, unknown>;
-      if (spec.name != null && typeof spec.name !== 'string') {
-        throw new Error('ERR_MANIFEST_INVALID: manifest.json "spec.name" must be a string when provided.');
-      }
-      if (spec.version != null) {
-        if (typeof spec.version !== 'string' || !MdzArchiveCore.SEMVER_RE.test(spec.version)) {
-          throw new Error('ERR_MANIFEST_INVALID: manifest.json "spec.version" must be a valid semver string when provided.');
-        }
-        const specMajor = Number.parseInt(spec.version.split('.')[0] ?? '0', 10);
-        if (specMajor > MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
-          throw new Error(
-            `ERR_VERSION_UNSUPPORTED: manifest.json spec.version ${spec.version} is not supported; this viewer supports major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.x only.`
-          );
-        }
-      }
-    }
-
-    if (candidate.mdz != null) {
-      if (typeof candidate.mdz !== 'string' || !MdzArchiveCore.SEMVER_RE.test(candidate.mdz)) {
-        throw new Error('ERR_MANIFEST_INVALID: manifest.json "mdz" must be a valid semver string when provided.');
-      }
-      const major = Number.parseInt(candidate.mdz.split('.')[0] ?? '0', 10);
-      if (major > MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
-        throw new Error(`ERR_VERSION_UNSUPPORTED: manifest.json targets mdz ${candidate.mdz}, but this viewer supports major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.x only.`);
-      }
-    }
-
-    if (candidate.producer != null) {
-      if (typeof candidate.producer !== 'object' || Array.isArray(candidate.producer)) {
-        throw new Error('ERR_MANIFEST_INVALID: manifest.json "producer" must be an object when provided.');
-      }
-      const producer = candidate.producer as Record<string, unknown>;
-      validateMetadataNode(producer.application, 'producer.application');
-      validateMetadataNode(producer.core, 'producer.core');
-    }
-
-    if (candidate.author != null) {
-      validateByNode(candidate.author, 'author');
-    }
-
-    validateTimestamp(candidate.created, 'created');
-    validateTimestamp(candidate.modified, 'modified');
   }
 
   /**
-   * Parses and validates `manifest.json` if present.
+   * Parses and checks `manifest.json` if present (§6.4).
    *
-   * Missing or invalid cover references are normalized away in returned data.
+   * Throws for an unreadable manifest or an invalid critical field (`spec`, `spec.version`,
+   * `mode`, `entryPoint`). Descriptive fields with a wrong type or value are ignored — left out
+   * of the returned object and reported by {@link validate} — as is a `cover` that names no file.
+   * Unknown fields are returned unchanged. For duplicate members the last one wins.
    */
   public async readManifest(): Promise<MdzManifest | null> {
     if (MdzArchiveCore.manifestCache.has(this.zip)) {
       return MdzArchiveCore.manifestCache.get(this.zip) ?? null;
     }
 
-    const entry = this.zip.files['manifest.json'];
-    if (!entry) {
+    const entry = this.findEntry('manifest.json');
+    if (!entry || entry.dir) {
       MdzArchiveCore.manifestCache.set(this.zip, null);
       return null;
     }
 
-    const raw = await entry.async('text');
-    let manifest: unknown;
-    try {
-      manifest = JSON.parse(String(raw));
-    } catch {
-      throw new Error('ERR_MANIFEST_INVALID: manifest.json is not valid JSON');
-    }
+    const { manifest, duplicateMembers } = parseManifestText(String(await entry.async('text')));
+    const ignoredFields = checkManifest(manifest);
+    MdzArchiveCore.checkLegacyMdzField(manifest);
 
-    MdzArchiveCore.validateManifest(manifest);
-
-    const normalized = { ...(manifest as MdzManifest) };
-    if (normalized.cover) {
-      const coverPath = MdzArchiveCore.normalizePath(normalized.cover);
-      const coverPathError = MdzArchiveCore.validateArchivePath(coverPath);
-      const coverEntry = Object.entries(this.zip.files).find(([p]) => MdzArchiveCore.normalizePath(p).toLowerCase() === coverPath.toLowerCase())?.[1];
-      const coverExistsAsFile = !!coverEntry && !coverEntry.dir;
-      if (coverPathError || !coverExistsAsFile) {
+    const normalized: Record<string, unknown> = { ...manifest };
+    for (const field of ignoredFields) delete normalized[field];
+    let missingCover: string | null = null;
+    if (typeof normalized.cover === 'string') {
+      const cover = this.findEntry(normalized.cover.replace(/^\.\//, ''));
+      if (!cover || cover.dir) {
+        missingCover = normalized.cover;
         delete normalized.cover;
       }
     }
 
-    MdzArchiveCore.manifestCache.set(this.zip, normalized);
-    return normalized;
+    MdzArchiveCore.manifestIssuesCache.set(this.zip, { ignoredFields, duplicateMembers, missingCover });
+    MdzArchiveCore.manifestCache.set(this.zip, normalized as MdzManifest);
+    return normalized as MdzManifest;
   }
 
   /**
@@ -1940,33 +1989,27 @@ export class MdzArchiveCore {
 
   /**
    * Validates archive conformance and returns errors/warnings.
+   *
+   * Errors: invalid entry names (§5.4), an unreadable manifest or invalid critical field (§6.4),
+   * and an entry point that can't be resolved (§5.5). Warnings: symbolic link entries, which are
+   * skipped (§4, §13.1); ignored descriptive manifest fields and duplicate members (§6.4); a
+   * missing `cover`; and missing version metadata.
    */
   public async validate(): Promise<MdzValidationResult> {
     const errors: string[] = [];
     const warnings: string[] = [];
 
-    const archivePaths = MdzArchiveCore.getArchivePaths(this.zip);
-
-    for (const path of archivePaths) {
-      const pathError = MdzArchiveCore.validateArchivePath(path);
-      if (pathError) errors.push(`ERR_PATH_INVALID: ${pathError}`);
+    for (const path of MdzArchiveCore.getArchivePaths(this.zip)) {
+      const problem = pathProblem(path);
+      if (problem) errors.push(`ERR_PATH_INVALID: ${problem.message}`);
+    }
+    for (const path of this.listSpecialFiles()) {
+      warnings.push(`ERR_PATH_INVALID: symbolic link '${path}' is ignored and never followed (§4, §13.1).`);
     }
 
     let manifest: MdzManifest | null = null;
     let manifestReadFailed = false;
-    const manifestEntry = this.findEntry('manifest.json');
-    if (manifestEntry) {
-      let rawManifest: Record<string, unknown> | null = null;
-      try {
-        const rawText = await manifestEntry.async('text');
-        const parsed = JSON.parse(String(rawText));
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          rawManifest = parsed as Record<string, unknown>;
-        }
-      } catch {
-        // readManifest() will report JSON parse errors as ERR_MANIFEST_INVALID
-      }
-
+    if (this.findEntry('manifest.json')) {
       try {
         manifest = await this.readManifest();
       } catch (error) {
@@ -1975,25 +2018,24 @@ export class MdzArchiveCore {
       }
 
       if (manifest) {
+        const issues = MdzArchiveCore.manifestIssuesCache.get(this.zip);
+        for (const field of issues?.ignoredFields ?? []) {
+          warnings.push(`manifest '${field}' has an invalid type or value and is ignored (§6.4).`);
+        }
+        if (issues?.duplicateMembers.length) {
+          warnings.push(`manifest.json repeats ${issues.duplicateMembers.map((m) => `'${m}'`).join(', ')}; the last of each is used (§6.4).`);
+        }
+        if (issues?.missingCover) {
+          warnings.push(`manifest 'cover' references '${issues.missingCover}' which does not exist in the archive.`);
+        }
+
         const specVersion = manifest.spec?.version;
         if (!specVersion || specVersion.trim() === '') {
           warnings.push("manifest 'spec.version' is missing; version metadata is unavailable.");
-        } else if (MdzArchiveCore.SEMVER_RE.test(specVersion)) {
-          const major = Number.parseInt(specVersion.split('.')[0] ?? '0', 10);
-          if (major < MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
-            warnings.push(
-              `manifest 'spec.version' major version ${major} is older than supported major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.`
-            );
-          }
-        }
-
-        const coverCandidate = typeof rawManifest?.cover === 'string' ? rawManifest.cover : manifest.cover;
-        if (coverCandidate) {
-          const cover = MdzArchiveCore.normalizePath(coverCandidate);
-          const coverEntry = this.findEntry(cover);
-          if (!coverEntry || coverEntry.dir) {
-            warnings.push(`manifest 'cover' references '${coverCandidate}' which does not exist in the archive.`);
-          }
+        } else if (Number.parseInt(specVersion, 10) < MdzArchiveCore.SUPPORTED_MDZ_MAJOR) {
+          warnings.push(
+            `manifest 'spec.version' major version ${Number.parseInt(specVersion, 10)} is older than supported major ${MdzArchiveCore.SUPPORTED_MDZ_MAJOR}.`
+          );
         }
       }
     } else {
@@ -2004,7 +2046,12 @@ export class MdzArchiveCore {
       try {
         await this.resolveEntryPoint();
       } catch (error) {
-        errors.push(error instanceof Error ? error.message : String(error));
+        let message = error instanceof Error ? error.message : String(error);
+        // A lookup that fails only because of case gets a suggestion, never a silent match (§5.4.1).
+        const wanted = typeof manifest?.entryPoint === 'string' ? manifest.entryPoint.replace(/^\.\//, '') : null;
+        const nearMatch = wanted && message.startsWith('ERR_ENTRYPOINT_MISSING') ? this.findCaseOnlyMatch(wanted) : null;
+        if (nearMatch) message += ` (did you mean "${nearMatch}"? Paths are case-sensitive.)`;
+        errors.push(message);
       }
     }
 
@@ -2036,7 +2083,7 @@ export class MdzArchiveCore {
     const sort = options?.sort !== false;
 
     const entries = Object.entries(zip.files)
-      .filter(([, entry]) => includeDirectories || !entry?.dir)
+      .filter(([, entry]) => (includeDirectories || !entry?.dir) && !isSymlinkEntry(entry))
       .map(([path, entry]) => ({
         path: normalize ? MdzArchiveCore.normalizePath(path) : path,
         isDirectory: !!entry?.dir
@@ -2084,7 +2131,7 @@ export class MdzArchiveCore {
   }
 
   private static getDocumentTitle(path: string, manifest: MdzManifest | null): string {
-    const mapped = manifest?.files?.find((file) => file.path.toLowerCase() === path.toLowerCase());
+    const mapped = manifest?.files?.find((file) => typeof file?.path === 'string' && samePath(file.path, path));
     if (mapped?.title?.trim()) return mapped.title.trim();
 
     const fileName = MdzArchiveCore.basename(path).replace(/\.[^/.]+$/, '');
@@ -2153,22 +2200,20 @@ export class MdzArchiveCore {
   }
 
   private static resolveAssetPathCase(assetPaths: string[], resolvedPath: string): string {
-    const lower = resolvedPath.toLowerCase();
-    const exact = assetPaths.find((p) => p.toLowerCase() === lower);
-    return exact ?? resolvedPath;
+    return assetPaths.find((p) => samePath(p, resolvedPath)) ?? resolvedPath;
   }
 
-  private static removeEntryIgnoreCase(zip: MutableZipLike, targetPath: string): void {
-    const targetLower = targetPath.toLowerCase();
+  private static removeEntrySamePath(zip: MutableZipLike, targetPath: string): void {
     for (const path of Object.keys(zip.files)) {
-      if (MdzArchiveCore.normalizePath(path).toLowerCase() === targetLower) {
+      if (samePath(MdzArchiveCore.normalizePath(path), targetPath)) {
         zip.remove(path);
       }
     }
   }
 
+  /** Files whose line endings a producer normalizes to LF when it writes them (§12.2). */
   private static isTextFile(path: string): boolean {
-    return /\.(md|markdown|json|txt|css|html|htm|xml|svg|yaml|yml|toml)$/i.test(path);
+    return isMarkdownPath(path) || path === 'manifest.json';
   }
 
   private static normaliseLf(content: string): string {
@@ -2176,7 +2221,7 @@ export class MdzArchiveCore {
   }
 
   private static async readExistingManifestObject(zip: ZipLike, requireValid: boolean): Promise<Record<string, unknown> | null> {
-    const manifestEntry = Object.entries(zip.files).find(([p, entry]) => MdzArchiveCore.normalizePath(p).toLowerCase() === 'manifest.json' && !entry.dir)?.[1];
+    const manifestEntry = Object.entries(zip.files).find(([p, entry]) => MdzArchiveCore.normalizePath(p) === 'manifest.json' && !entry.dir)?.[1];
     if (!manifestEntry) return null;
 
     const raw = await manifestEntry.async('text');
@@ -2243,10 +2288,6 @@ export class MdzArchiveCore {
       next.modified = now;
     }
     return next;
-  }
-
-  private static ensureCreatableEntryPoint(archivePaths: string[], manifest?: Pick<MdzManifest, 'entryPoint'> | null): void {
-    MdzArchiveCore.resolveEntryPointStrict(archivePaths, manifest);
   }
 
   private static async readMutationInputAsText(content: MdzArchiveMutationInput): Promise<string> {
@@ -2367,8 +2408,10 @@ export class MdzPackagerCore {
    * @param usedPaths - Case-insensitive set of already-used paths.
    */
   public static makeUniqueArchivePath(candidate: string, usedPaths: Set<string>): string {
-    if (!usedPaths.has(candidate.toLowerCase())) {
-      usedPaths.add(candidate.toLowerCase());
+    // Keys are NFC and case-folded: two names that differ only in case would collide on
+    // case-insensitive filesystems, which §5.4 says archives SHOULD NOT contain.
+    if (!usedPaths.has(nfc(candidate).toLowerCase())) {
+      usedPaths.add(nfc(candidate).toLowerCase());
       return candidate;
     }
 
@@ -2382,8 +2425,8 @@ export class MdzPackagerCore {
     let n = 2;
     while (true) {
       const next = `${dir}${base}-${n}${ext}`;
-      if (!usedPaths.has(next.toLowerCase())) {
-        usedPaths.add(next.toLowerCase());
+      if (!usedPaths.has(nfc(next).toLowerCase())) {
+        usedPaths.add(nfc(next).toLowerCase());
         return next;
       }
       n += 1;
@@ -2480,7 +2523,7 @@ export class MdzPackagerCore {
 
     const now = new Date().toISOString();
 
-    return {
+    return MdzPackagerCore.pruneManifest({
       spec: {
         name: 'mdzip-spec',
         version: PRODUCER_SPEC_VERSION
@@ -2494,15 +2537,32 @@ export class MdzPackagerCore {
       },
       title: options.title || rootName,
       mode: options.mode || undefined,
-      entryPoint: options.entryPoint || null,
-      language: options.language || 'en',
+      entryPoint: options.entryPoint || undefined,
+      language: options.language || undefined,
       author: options.author ? { name: options.author } : undefined,
-      authors: options.author ? [{ name: options.author }] : null,
-      description: options.description || null,
-      version: options.docVersion || null,
+      authors: options.author ? [{ name: options.author }] : undefined,
+      description: options.description || undefined,
+      version: options.docVersion || undefined,
       created: now,
       modified: now
-    };
+    });
+  }
+
+  /** Library-managed manifest fields that are left out rather than written as `null` (§6.4). */
+  private static readonly OPTIONAL_MANIFEST_FIELDS = [
+    'title', 'mode', 'entryPoint', 'language', 'author', 'authors', 'description', 'version', 'license', 'keywords', 'cover'
+  ] as const;
+
+  /**
+   * Removes library-managed fields that are `null` or `undefined`: §6.4 treats `null` as a wrong
+   * type, so a missing value is written as an absent member. Unknown fields are left alone.
+   */
+  private static pruneManifest<T extends MdzManifest>(manifest: T): T {
+    const record = manifest as unknown as Record<string, unknown>;
+    for (const field of MdzPackagerCore.OPTIONAL_MANIFEST_FIELDS) {
+      if (record[field] == null) delete record[field];
+    }
+    return manifest;
   }
 
   /**
@@ -2555,7 +2615,7 @@ export class MdzPackagerCore {
   public static createManifest(metadata?: MdzManifestEditableMetadata & Pick<MdzManifest, 'mode' | 'entryPoint'>): MdzManifest {
     const now = new Date().toISOString();
     const author = typeof metadata?.author === 'string' ? { name: metadata.author } : (metadata?.author ?? undefined);
-    return {
+    return MdzPackagerCore.pruneManifest({
       spec: {
         name: 'mdzip-spec',
         version: PRODUCER_SPEC_VERSION
@@ -2569,18 +2629,18 @@ export class MdzPackagerCore {
       },
       title: metadata?.title ?? undefined,
       mode: metadata?.mode ?? undefined,
-      entryPoint: metadata?.entryPoint ?? null,
-      language: metadata?.language ?? 'en',
+      entryPoint: metadata?.entryPoint ?? undefined,
+      language: metadata?.language ?? undefined,
       author,
-      authors: author ? [author] : null,
-      description: metadata?.description ?? null,
-      version: metadata?.version ?? null,
+      authors: author ? [author] : undefined,
+      description: metadata?.description ?? undefined,
+      version: metadata?.version ?? undefined,
       license: metadata?.license ?? undefined,
       keywords: metadata?.keywords ?? undefined,
       cover: metadata?.cover ?? undefined,
       created: now,
       modified: now
-    };
+    });
   }
 
   /**
@@ -2598,25 +2658,26 @@ export class MdzPackagerCore {
     const next: MdzManifest = manifest ? { ...manifest } : MdzPackagerCore.createManifest(updates);
     MdzPackagerCore.ensureCanonicalManifest(next, options);
 
+    // A null/undefined update removes the field (it is never written as `null`, §6.4).
     if (updates) {
       if ('title' in updates) next.title = updates.title ?? undefined;
       if ('author' in updates) {
         const author = typeof updates.author === 'string' ? { name: updates.author } : (updates.author ?? undefined);
         next.author = author;
-        next.authors = author ? [author] : null;
+        next.authors = author ? [author] : undefined;
       }
-      if ('description' in updates) next.description = updates.description ?? null;
+      if ('description' in updates) next.description = updates.description ?? undefined;
       if ('keywords' in updates) next.keywords = updates.keywords ?? undefined;
-      if ('language' in updates) next.language = updates.language ?? null;
+      if ('language' in updates) next.language = updates.language ?? undefined;
       if ('license' in updates) next.license = updates.license ?? undefined;
-      if ('version' in updates) next.version = updates.version ?? null;
+      if ('version' in updates) next.version = updates.version ?? undefined;
       if ('cover' in updates) next.cover = updates.cover ?? undefined;
       if ('mode' in updates) next.mode = updates.mode ?? undefined;
-      if ('entryPoint' in updates) next.entryPoint = updates.entryPoint ?? null;
+      if ('entryPoint' in updates) next.entryPoint = updates.entryPoint ?? undefined;
     }
 
     MdzPackagerCore.ensureCanonicalManifest(next, options);
-    return next;
+    return MdzPackagerCore.pruneManifest(next);
   }
 
   /**
@@ -2749,8 +2810,9 @@ export class MdzPackagerCore {
     return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   }
 
+  /** Files whose line endings a producer normalizes to LF when it writes them (§12.2). */
   private static isTextFile(path: string): boolean {
-    return /\.(md|markdown|json|txt|css|html|htm|xml|svg|yaml|yml|toml)$/i.test(path);
+    return isMarkdownPath(path) || path === 'manifest.json';
   }
 
   private static isImagePath(path: string): boolean {
@@ -2758,7 +2820,7 @@ export class MdzPackagerCore {
   }
 
   private static async readProvidedManifest(selected: MdzSelectedFile[]): Promise<MdzManifest | null> {
-    const manifestItem = selected.find((item) => item.archivePath.toLowerCase() === 'manifest.json');
+    const manifestItem = selected.find((item) => item.archivePath === 'manifest.json');
     if (!manifestItem) return null;
 
     const raw = manifestItem.file ? await manifestItem.file.text() : (manifestItem.text ?? '');
@@ -2852,14 +2914,15 @@ export class MdzPackagerCore {
 
     for (const item of cleanInput) {
       const originalPath = item.path;
-      let archivePath = originalPath;
+      // Producers write NFC paths (§5.4).
+      let archivePath = nfc(originalPath);
 
       if (!MdzPackagerCore.matchesAnyFilter(originalPath, options.filters)) {
         addSkip('excluded by filter');
         continue;
       }
 
-      if (manifest && archivePath.toLowerCase() === 'manifest.json') {
+      if (manifest && archivePath === 'manifest.json') {
         addSkip('manifest.json replaced by generated manifest');
         continue;
       }
@@ -2889,8 +2952,20 @@ export class MdzPackagerCore {
       }
     }
 
+    // A conforming producer always writes manifest.json (§14.1): generated from the options,
+    // the caller's own manifest.json, or a minimal one.
+    let writeManifest = !!manifest;
     if (!manifest) {
       manifest = await MdzPackagerCore.readProvidedManifest(selected);
+      if (manifest && !manifest.spec?.version) {
+        manifest.spec = { ...(manifest.spec ?? {}), version: PRODUCER_SPEC_VERSION };
+        writeManifest = true;
+      }
+    }
+    const modeWasSet = !!manifest?.mode;
+    if (!manifest) {
+      manifest = MdzPackagerCore.createManifest({ title: options.title || rootName });
+      writeManifest = true;
     }
 
     let archivePaths = selected.map((f) => f.archivePath);
@@ -2898,7 +2973,7 @@ export class MdzPackagerCore {
     const warningMessages: string[] = [];
     const markdownPaths = archivePaths.filter(MdzArchiveCore.isMarkdownFile);
 
-    if (!manifest?.mode && markdownPaths.length > 1) {
+    if (!modeWasSet && markdownPaths.length > 1) {
       warningMessages.push(
         'Archive contains multiple Markdown files and no explicit manifest.mode; consumers will default to document mode. If these files are intended as separate documents, set mode: "project".'
       );
@@ -2916,11 +2991,21 @@ export class MdzPackagerCore {
       if (manifest) manifest.entryPoint = 'index.md';
     }
 
-    if (manifest?.entryPoint && !archivePaths.some((p) => p.toLowerCase() === manifest.entryPoint!.toLowerCase())) {
-      throw new Error(`ERR_PACK_ENTRYPOINT_MISSING: Manifest entry-point "${manifest.entryPoint}" does not exist in archive.`);
+    const declaredEntryPoint = manifest.entryPoint;
+    if (declaredEntryPoint && !archivePaths.some((p) => samePath(p, declaredEntryPoint.replace(/^\.\//, '')))) {
+      throw new Error(`ERR_PACK_ENTRYPOINT_MISSING: Manifest entry-point "${declaredEntryPoint}" does not exist in archive.`);
+    }
+    // entryPoint is required in a producer's manifest (§6.2, §14.1): record the one that resolved.
+    if (!declaredEntryPoint && resolvedEntryPoint) {
+      manifest.entryPoint = resolvedEntryPoint;
+      writeManifest = true;
+    }
+    if (!manifest.mode) {
+      manifest.mode = 'document';
+      writeManifest = true;
     }
 
-    if (options.mapFiles && manifest) {
+    if (options.mapFiles) {
       manifest.files = manifestFiles;
     }
 
@@ -2969,7 +3054,8 @@ export class MdzPackagerCore {
       }
     }
 
-    if (manifest) {
+    // A caller's own complete manifest.json was written above as given; otherwise write ours.
+    if (writeManifest) {
       zip.file('manifest.json', JSON.stringify(manifest, null, 2));
     }
 

@@ -7,8 +7,9 @@ Core TypeScript/JavaScript library for MDZip (`.mdz`) archives.
 Current scope (core only):
 - open/unpack archive data
 - public archive listing/read APIs (`listPaths`, `listEntries`, `readText`, `readBytes`, `readBase64`, `readDataUri`)
-- manifest validation (MDZip spec `1.1.0` aligned, including `manifest.mode`)
-- entry-point resolution
+- manifest validation per MDZip spec `1.2.0` (critical vs. descriptive fields, duplicate members)
+- entry-point resolution (`ERR_ENTRYPOINT_INVALID` vs `ERR_ENTRYPOINT_MISSING`, support files set aside)
+- link resolution inside, out of and into archives (`resolveLink`)
 - archive conformance validation (`errors` + `warnings`)
 - archive mutation helpers (`addFile`, `removeFile`, `removeFiles`) with entry-point safety
 - orphaned image analysis (`findOrphanedAssets`) for cleanup workflows
@@ -40,6 +41,18 @@ if (orphaned.orphanedAssetPaths.length > 0) {
 	await MdzArchiveCore.removeFiles(fileOrArrayBuffer, orphaned.orphanedAssetPaths);
 }
 ```
+
+## Spec 1.2.0 behaviour
+
+This release implements MDZip spec [1.2.0](https://github.com/mdzip-project/mdzip-spec/releases/tag/v1.2.0) and runs its shared fixtures (`tests/fixtures`, synced with `mdzip-spec/tools/sync-fixtures.mjs --ref v1.2.0`). Things to know when upgrading:
+
+- **Paths are case-sensitive** after Unicode NFC normalization (§5.4.1): `Index.md` no longer finds `index.md`. Use `archive.findCaseOnlyMatch(path)` to suggest the near match after a failed lookup.
+- **Entry names are checked on open**: two entries equal after NFC (`ERR_DUPLICATE_PATH`) or a file that is also a directory (`ERR_PATH_CONFLICT`) make `open()` throw; a compression method other than stored/DEFLATE is `ERR_ZIP_INVALID`.
+- **Symbolic link entries** are skipped and never followed: they're not in `listPaths()`, can't be read, are listed by `listSpecialFiles()` and reported by `validate()`. Mutations keep them unless `dropSpecialFiles: true`.
+- **Manifests**: an invalid critical field (`spec`, `spec.version`, `mode`, `entryPoint`) throws; an invalid descriptive field is left out of `readManifest()` and reported by `validate()`. `null` counts as a wrong type.
+- **Producers always write `manifest.json`** with `spec.version` `1.2.0`, `entryPoint`, `title` and `mode`, and never write `null` placeholders. `updateFiles()` adds a manifest to an archive without one, keeps every existing manifest field, and throws `ERR_ENTRYPOINT_CHANGED` if a change would move the entry point (set `entryPoint` in the manifest to move it on purpose).
+- **Line endings**: only Markdown files and `manifest.json` are normalized to LF when written (§12.2); other files are stored as given.
+- The pure rules are exported too: `pathProblem`, `entrySetProblem`, `samePath`, `checkManifest`, `parseManifestText`, `resolveLink`.
 
 ## Workspace API
 

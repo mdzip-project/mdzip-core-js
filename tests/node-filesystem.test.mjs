@@ -44,7 +44,8 @@ test('extractArchive recreates archive files and protects existing targets', asy
     await packDirectory(source, archivePath);
 
     const result = await extractArchive(archivePath, destination);
-    assert.deepEqual(result.extractedPaths, ['docs/guide.md', 'index.md', 'raw.bin']);
+    // A conforming producer always writes manifest.json (§14.1).
+    assert.deepEqual(result.extractedPaths, ['docs/guide.md', 'index.md', 'manifest.json', 'raw.bin']);
     assert.equal(await fs.readFile(path.join(destination, 'docs', 'guide.md'), 'utf8'), '# Guide\n');
     assert.match(await fs.readFile(path.join(destination, 'index.md'), 'utf8'), /docs\/guide\.md/);
     assert.deepEqual(Array.from(await fs.readFile(path.join(destination, 'raw.bin'))), [9, 8, 7]);

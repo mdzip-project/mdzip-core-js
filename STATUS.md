@@ -1,5 +1,5 @@
 Status: awaiting-test
-Last:   Branch feat/spec-1.2-entry-point: spec 1.2.0 entry-point rules (support files, INVALID vs MISSING, NFC case-sensitive) — 71 pass; please review
+Last:   Branch feat/spec-1.2-entry-point: v2.0.0 (spec 1.2.0 complete, all v1.2.0 fixtures, 82 pass); release notes in RELEASE-v2.0.0.md — not committed
 
 Owner to-do (review/commit/release steps): ../planning/owner-todo.md
 

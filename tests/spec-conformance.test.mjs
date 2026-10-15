@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from '@progress/jszip-esm';
 
-import { MdzArchiveCore, MdzPackagerCore } from '../dist/index.js';
+import { MdzArchiveCore, MdzPackagerCore, mdzErrorCode } from '../dist/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,15 +29,6 @@ async function openFixtureArchive(fileName) {
   return MdzArchiveCore.open(raw);
 }
 
-function toFixturePathError(validationError) {
-  const map = {
-    'leading slash': 'ERR_PATH_LEADING_SLASH',
-    'path traversal': 'ERR_PATH_TRAVERSAL',
-    'reserved character': 'ERR_PATH_RESERVED_CHAR',
-    'control char': 'ERR_PATH_CONTROL_CHAR'
-  };
-  return map[validationError] ?? 'ERR_PATH_UNKNOWN';
-}
 
 test('T-001 minimal fixture resolves index.md', async () => {
   const archive = await openFixtureArchive('minimal.mdz');
@@ -79,20 +70,28 @@ test('T-005 line-endings-crlf fixture is accepted and readable', async () => {
 test('machine fixture: entrypoint-cases.json', async () => {
   const fixture = JSON.parse(await fs.readFile(path.join(fixturesDir, 'entrypoint-cases.json'), 'utf8'));
   for (const c of fixture) {
-    const actual = MdzPackagerCore.resolveEntryPoint(c.files, c.manifest);
-    assert.equal(actual, c.expectedEntryPoint, c.name);
+    // A malformed manifest is given as raw text in `manifestJson` (with `manifest: null`).
+    const manifest = c.manifestJson !== undefined ? JSON.parse(c.manifestJson) : c.manifest;
+    const files = c.files.filter((f) => f !== 'manifest.json');
+    if (c.expectedEntryPoint === null) {
+      assert.throws(() => MdzArchiveCore.resolveEntryPointStrict(files, manifest), (error) => {
+        if (c.expectedError) assert.equal(mdzErrorCode(error), c.expectedError, c.name);
+        return true;
+      }, c.name);
+    } else {
+      assert.equal(MdzArchiveCore.resolveEntryPointStrict(files, manifest), c.expectedEntryPoint, c.name);
+    }
   }
 });
 
 test('machine fixture: path-validation-cases.json', async () => {
   const fixture = JSON.parse(await fs.readFile(path.join(fixturesDir, 'path-validation-cases.json'), 'utf8'));
   for (const c of fixture) {
-    const validationError = MdzArchiveCore.validateArchivePath(c.path);
-    const isValid = validationError == null;
-    assert.equal(isValid, c.valid, c.name);
-
+    const problem = MdzArchiveCore.pathProblem(c.path);
+    assert.equal(problem == null, c.valid, c.name);
+    assert.equal(MdzArchiveCore.validateArchivePath(c.path) == null, c.valid, c.name);
     if (!c.valid) {
-      assert.equal(toFixturePathError(validationError), c.errorCode, c.name);
+      assert.equal(problem.code, c.errorCode, c.name);
     }
   }
 });
@@ -253,7 +252,7 @@ test('generated producer manifest includes spec.version', async () => {
   const pkg = JSON.parse(await fs.readFile(path.join(__dirname, '..', 'package.json'), 'utf8'));
 
   assert.ok(manifest);
-  assert.equal(manifest.spec.version, '1.1.0');
+  assert.equal(manifest.spec.version, '1.2.0');
   assert.equal(manifest.spec.name, 'mdzip-spec');
   assert.equal(manifest.producer.core.version, pkg.version);
   assert.equal(manifest.producer.core.url, 'https://github.com/mdzip-project/mdzip-core-js');
@@ -271,7 +270,7 @@ test('generated producer manifest supports explicit project mode', () => {
 
   assert.ok(manifest);
   assert.equal(manifest.mode, 'project');
-  assert.equal(manifest.spec.version, '1.1.0');
+  assert.equal(manifest.spec.version, '1.2.0');
 });
 
 test('buildArchive warns when multiple markdown files rely on implicit document mode', async () => {
@@ -467,7 +466,12 @@ test('addFile adds a new entry', async () => {
   const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
   const added = outZip.file('assets/note.txt');
   assert.ok(added);
-  assert.equal(await added.async('text'), 'line1\nline2\n');
+  // §12.2: only Markdown and manifest.json get LF line endings; other files are written as given.
+  assert.equal(await added.async('text'), 'line1\r\nline2\r\n');
+
+  const md = await MdzArchiveCore.addFile(raw, 'notes.md', 'a\r\nb\r\n');
+  const mdZip = await new JSZip().loadAsync(await md.blob.arrayBuffer());
+  assert.equal(await mdZip.file('notes.md').async('text'), 'a\nb\n');
 });
 
 test('addFile replaces existing entry', async () => {
@@ -513,7 +517,7 @@ test('addFile manifest replacement injects spec.version and refreshes modified',
   const manifestRaw = await outZip.file('manifest.json').async('text');
   const manifest = JSON.parse(manifestRaw);
 
-  assert.equal(manifest.spec.version, '1.1.0');
+  assert.equal(manifest.spec.version, '1.2.0');
   assert.equal(manifest.created.by.name, 'Author');
   assert.ok(typeof manifest.modified === 'string' || typeof manifest.modified?.when === 'string');
 });
@@ -526,7 +530,7 @@ test('addFile refreshes manifest modified and injects missing spec.version', asy
 
   const result = await MdzArchiveCore.addFile(raw, 'assets/new.txt', 'new');
   assert.ok(result.manifest);
-  assert.equal(result.manifest.spec.version, '1.1.0');
+  assert.equal(result.manifest.spec.version, '1.2.0');
   assert.notEqual(result.manifest.modified, '2000-01-01T00:00:00.0000000Z');
 });
 
@@ -595,7 +599,7 @@ test('listEntries reports markdown/image/directory metadata', async () => {
   assert.equal(byPath['assets/pic.PNG'].isImage, true);
 });
 
-test('hasEntry supports file, directory, and case-insensitive lookup', async () => {
+test('hasEntry supports file and directory lookup, case-sensitively (§5.4.1)', async () => {
   const zip = new JSZip();
   zip.folder('assets');
   zip.file('assets/one.txt', '1');
@@ -603,7 +607,8 @@ test('hasEntry supports file, directory, and case-insensitive lookup', async () 
 
   const archive = await MdzArchiveCore.open(raw);
   assert.equal(archive.hasEntry('assets/one.txt'), true);
-  assert.equal(archive.hasEntry('ASSETS/ONE.TXT'), true);
+  assert.equal(archive.hasEntry('ASSETS/ONE.TXT'), false);
+  assert.equal(archive.findCaseOnlyMatch('ASSETS/ONE.TXT'), 'assets/one.txt');
   assert.equal(archive.hasEntry('assets'), true);
   assert.equal(archive.hasEntry('missing.txt'), false);
 });
@@ -635,14 +640,15 @@ test('read* APIs reject missing and directory paths with typed errors', async ()
   await assert.rejects(() => archive.readText('assets'), /ERR_IS_DIRECTORY/);
 });
 
-test('removeFiles removes multiple entries case-insensitively', async () => {
+test('removeFiles removes multiple entries; paths are case-sensitive (§5.4.1)', async () => {
   const zip = new JSZip();
   zip.file('index.md', '# hello\n');
   zip.file('assets/one.txt', '1');
   zip.file('assets/two.txt', '2');
   const raw = await zip.generateAsync({ type: 'uint8array' });
 
-  const result = await MdzArchiveCore.removeFiles(raw, ['ASSETS/ONE.TXT', 'assets/two.txt']);
+  await assert.rejects(() => MdzArchiveCore.removeFiles(raw, ['ASSETS/ONE.TXT']), /ERR_NOT_FOUND/);
+  const result = await MdzArchiveCore.removeFiles(raw, ['assets/one.txt', 'assets/two.txt']);
   const outZip = await new JSZip().loadAsync(await result.blob.arrayBuffer());
 
   assert.equal(outZip.file('assets/one.txt'), null);

@@ -1,5 +1,57 @@
 # Changelog
 
+## [2.0.0] - 2026-10-14
+
+Implements MDZip spec **1.2.0** (issue #4) and runs all of its shared fixtures,
+synced to the `v1.2.0` tag. A major version because several changes alter
+behaviour callers may rely on; see the README's "Spec 1.2.0 behaviour" section.
+
+### Migrating from 1.x
+- Path lookups (`findEntry`, `hasEntry`, `read*`, `removeFiles`) are now
+  case-sensitive. Use the exact stored path; `findCaseOnlyMatch()` can suggest it.
+- `open()` can throw `ERR_DUPLICATE_PATH`, `ERR_PATH_CONFLICT` or `ERR_ZIP_INVALID`.
+- Archives written by `buildArchive`/`buildWorkspace`/`updateFiles` always contain
+  `manifest.json`.
+- `updateFiles` can throw `ERR_ENTRYPOINT_CHANGED`; pass a manifest with the new
+  `entryPoint` to move the entry point on purpose.
+- `readManifest()` leaves out descriptive fields with invalid values instead of
+  throwing; `"entryPoint": null` now throws `ERR_ENTRYPOINT_INVALID`.
+- Non-Markdown text files keep their line endings when written.
+
+### Added
+- `src/spec.ts`, exported: `pathProblem`, `entrySetProblem`, `samePath`,
+  `findPath`, `checkManifest`, `parseManifestText`, `findDuplicateMembers`,
+  `entryPointProblem`, `coverProblem`, `resolveLink` (§9.3–9.6, including the
+  trust boundary and embeds) and `mdzErrorCode`.
+- `MdzArchiveCore`: `resolveLink()`, `listSpecialFiles()`, `findCaseOnlyMatch()`,
+  `pathProblem()`.
+- `MdzUpdateFilesOptions.dropSpecialFiles`.
+- Tests for manifest cases (T-012), entry sets (T-013), path matching (T-009),
+  link resolution (T-011), round trips (P-004, P-005) and the archive cases
+  (T-014, T-015, T-017, P-008).
+
+### Changed
+- Paths are compared case-sensitively after NFC normalization everywhere
+  (lookups, removals, writes, orphan analysis, cover, workspace) (§5.4.1).
+- `open()` throws `ERR_DUPLICATE_PATH` / `ERR_PATH_CONFLICT` (§5.4, §13.1) and
+  `ERR_ZIP_INVALID` for compression methods other than 0 and 8 or an unreadable
+  ZIP (§4).
+- Symbolic link entries are skipped, never followed, and reported (§4, §13.1).
+- Manifest validation follows §6.4: critical fields throw; invalid descriptive
+  fields are ignored (left out of `readManifest()`, reported by `validate()`);
+  `null` is a wrong type (`"entryPoint": null` is `ERR_ENTRYPOINT_INVALID`);
+  duplicate members are reported. Timestamps must be RFC 3339; `spec.version`
+  uses the semver.org grammar.
+- Path validation rejects empty and `.` segments (`ERR_PATH_INVALID`).
+- Producers always write `manifest.json` with `spec.version` `1.2.0`,
+  `entryPoint`, `title` and `mode`; no `null` placeholders, and no default
+  `language: "en"` (§6.2: an omitted language is unspecified).
+- `updateFiles()` keeps the existing manifest as read (unknown and ignored fields
+  survive, §6.3), adds a manifest to an archive without one, and throws
+  `ERR_ENTRYPOINT_CHANGED` if a change would move the entry point (§14.1).
+- Paths are written in NFC.
+- Line endings are normalized only for Markdown files and `manifest.json` (§12.2).
+
 ## [1.5.0] - 2026-09-07
 
 ### Added

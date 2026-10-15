@@ -13,13 +13,17 @@ Read `README.md` before looking at source or type files.
 
 Most operations are static (e.g., `MdzArchiveCore.open()`, `MdzArchiveCore.addFile()`). Instance methods operate on an already-opened `MdzArchiveCore` object. Static methods accept archive bytes; instance methods work with the open archive.
 
-**Paths are case-insensitive**
+**Paths are case-sensitive (spec 1.2.0 §5.4.1)**
 
-Archive paths are normalized and compared case-insensitively. `index.md` and `Index.md` refer to the same entry.
+Archive paths are compared case-sensitively after Unicode NFC normalization. `index.md` and `Index.md` are different entries; `findCaseOnlyMatch()` suggests the near match for an error message. Never fall back to a case-insensitive match silently.
 
 **Entry point resolution**
 
-Manifest `entryPoint` is optional. If missing, the library infers it: first `.md` file in root, or `index.md` if present. Call `resolveEntryPoint()` to get the inferred path.
+Consumers don't require `manifest.json`, but producers always write one with `entryPoint`. Resolution (§5.5): manifest `entryPoint` (an invalid value is `ERR_ENTRYPOINT_INVALID`, a missing file `ERR_ENTRYPOINT_MISSING`, never a fallback); else `index.md`; else the single root Markdown file once support files (README, AGENTS, LICENSE, CHANGELOG, CONTRIBUTING) are set aside. Call `resolveEntryPoint()`.
+
+**Spec rules live in `src/spec.ts`**
+
+Path validation/matching, manifest checks and link resolution are pure functions there, ported from (and kept in step with) `mdzip-core-python`. `tests/spec-1.2-fixtures.test.mjs` runs the spec's shared fixtures against them.
 
 **Mutation returns new bytes, not mutated archives**
 
