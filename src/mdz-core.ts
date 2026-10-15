@@ -26,7 +26,7 @@ import {
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = MDZ_SPEC_VERSION;
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '2.0.0';
+const CORE_LIBRARY_VERSION = '2.0.1';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
@@ -893,6 +893,12 @@ export class MdzArchiveCore {
           true
         );
       }
+    }
+    // Producers MUST write entryPoint (§14.1). A manifest that doesn't name one records the file the
+    // archive opened at, so adding another root Markdown file can't make discovery ambiguous.
+    if (manifestObject && !('entryPoint' in manifestObject) && entryPointBefore
+      && !normalizedRemovals.has(nfc(entryPointBefore))) {
+      manifestObject.entryPoint = entryPointBefore;
     }
     if (manifestObject) {
       normalizedWrites.set('manifest.json', {

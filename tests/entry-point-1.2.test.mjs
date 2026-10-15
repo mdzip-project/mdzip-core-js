@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+import JSZip from '@progress/jszip-esm';
+
 import { MdzArchiveCore, MdzPackagerCore } from '../dist/index.js';
 
 const codeOf = (fn) => {
@@ -75,6 +77,29 @@ test('archive without a manifest resolves with support files set aside', async (
   const bytes = new Uint8Array(await blob.arrayBuffer());
   const archive = await MdzArchiveCore.open(bytes);
   assert.equal(await archive.resolveEntryPoint(), 'recipes.md');
+});
+
+async function zipOf(entries) {
+  const zip = new JSZip();
+  for (const [name, text] of Object.entries(entries)) zip.file(name, text);
+  return zip.generateAsync({ type: 'uint8array' });
+}
+
+test('saving records the entry point in a manifest that lacks one (§14.1)', async () => {
+  const before = await zipOf({ 'notes.md': '# Notes\n', 'manifest.json': '{"title": "t", "x-tool": 1}' });
+
+  // Adding a second root Markdown file would make discovery ambiguous; the entry point stays put.
+  const added = await MdzArchiveCore.updateFiles(before, [{ path: 'other.md', content: '# Other\n' }]);
+  assert.equal(added.resolvedEntryPoint, 'notes.md');
+  assert.equal(added.manifest.entryPoint, 'notes.md');
+
+  // Same when the caller passes a manifest without entryPoint (as an editor saving its model does).
+  const passed = await MdzArchiveCore.updateFiles(before, [{ path: 'other.md', content: '# Other\n' }], [], { manifest: { title: 't' } });
+  assert.equal(passed.resolvedEntryPoint, 'notes.md');
+
+  // Removing the entry file doesn't record a name that's gone.
+  const two = await zipOf({ 'a.md': '# A\n', 'b.md': '# B\n', 'index.md': '# I\n', 'manifest.json': '{"title": "t"}' });
+  await assert.rejects(MdzArchiveCore.updateFiles(two, [], ['index.md']), /ERR_ENTRYPOINT_UNRESOLVED/);
 });
 
 const draftDir = process.env.MDZIP_SPEC_FIXTURES;

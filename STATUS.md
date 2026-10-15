@@ -1,5 +1,5 @@
-Status: awaiting-test
-Last:   Branch feat/spec-1.2-entry-point: v2.0.0 (spec 1.2.0 complete, all v1.2.0 fixtures, 82 pass); release notes in RELEASE-v2.0.0.md — not committed
+Status: ready-to-commit
+Last:   Branch fix/record-entry-point: v2.0.1, updateFiles records entryPoint in a manifest that lacks one (found moving the editor to 2.0.0)
 
 Owner to-do (review/commit/release steps): ../planning/owner-todo.md
 
