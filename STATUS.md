@@ -1,5 +1,5 @@
-Status: ready-to-commit
-Last:   Branch fix/record-entry-point: v2.0.1, updateFiles records entryPoint in a manifest that lacks one (found moving the editor to 2.0.0)
+Status: idle
+Last:   Released v2.0.1: updateFiles records entryPoint in a manifest that lacks one; npm + GitHub release (2026-10-14)
 
 Owner to-do (review/commit/release steps): ../planning/owner-todo.md
 
