@@ -930,6 +930,19 @@ test('updateFiles applies writes and removals in one byte-level patch', async ()
   assert.equal(await reopened.readText('chapter2.md'), '# Chapter 2 updated\nwith crlf\n');
 });
 
+test('updateFiles writes and removes directory entries', async () => {
+  const zip = new JSZip();
+  zip.file('index.md', '# Home\n');
+  zip.folder('old');
+  const raw = await zip.generateAsync({ type: 'uint8array' });
+
+  const result = await MdzArchiveCore.updateFiles(raw, [{ path: 'empty/', content: '' }], ['old/']);
+  const archive = await MdzArchiveCore.open(new Uint8Array(await result.blob.arrayBuffer()));
+  const dirs = archive.listEntries({ includeDirectories: true }).filter((e) => e.isDirectory).map((e) => e.path);
+  assert.deepEqual(dirs, ['empty/']);
+  assert.equal(await archive.resolveEntryPoint(), 'index.md');
+});
+
 test('updateFiles enforces removal existence, path validity, and entry-point integrity', async () => {
   const raw = await buildUpdateFilesFixture();
 

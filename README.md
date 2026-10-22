@@ -1,4 +1,4 @@
-# mdzip-core-js
+# @mdzip/core-js
 
 [![npm](https://img.shields.io/npm/v/@mdzip/core-js)](https://www.npmjs.com/package/@mdzip/core-js)
 
@@ -22,13 +22,13 @@ ZIP runtime note:
 ## Install
 
 ```bash
-npm install mdzip-core-js
+npm install @mdzip/core-js
 ```
 
 ## Usage
 
 ```ts
-import { MdzArchiveCore } from 'mdzip-core-js';
+import { MdzArchiveCore } from '@mdzip/core-js';
 
 const archive = await MdzArchiveCore.open(fileOrArrayBuffer);
 const entryPoint = await archive.resolveEntryPoint();
@@ -41,6 +41,97 @@ if (orphaned.orphanedAssetPaths.length > 0) {
 	await MdzArchiveCore.removeFiles(fileOrArrayBuffer, orphaned.orphanedAssetPaths);
 }
 ```
+
+## Show a document with its images
+
+Image paths in a document are relative to that document, not to the archive
+root. `resolveLink(document, link, host?, { use })` resolves one, and
+`readDataUri(path)` turns an entry into a `data:` URL you can use as an
+`<img src>`. Pass `src` as it appears in the rendered HTML: percent-encoding
+(`my%20photo.png`) is decoded for you.
+
+```ts
+const entry = await archive.resolveEntryPoint();
+const template = document.createElement('template');   // inert: nothing loads yet
+template.innerHTML = sanitize(renderMarkdown(await archive.readText(entry)));
+
+for (const img of template.content.querySelectorAll('img')) {
+	const target = archive.resolveLink(entry, img.getAttribute('src') ?? '', undefined, { use: 'embed' });
+	if (target.kind === 'internal') img.src = await archive.readDataUri(target.entry!);
+	else if (target.kind !== 'url') img.removeAttribute('src');   // not in the archive
+}
+preview.replaceChildren(template.content);
+```
+
+Rewrite the images before the HTML reaches the page. Otherwise the browser
+requests each relative path from your own server first.
+
+`resolveLink` returns a `kind`:
+
+| `kind` | Meaning | Fields |
+|---|---|---|
+| `internal` | An entry in this archive | `entry`, `fragment` |
+| `url` | A URL with a scheme, such as `https:`, `data:` or `mailto:` | |
+| `host` | A file outside the archive (needs a `host` that knows where the archive is) | `path`, `fragment` |
+| `archive` | An entry in another `.mdz` (needs a `host`) | `archive`, `entry`, `fragment` |
+| `unresolved` | Not found, invalid (for example `/abs.png`), or outside the trust boundary | `reason` |
+
+`use` is `'navigate'` (the default) for links the user follows, or `'embed'`
+for resources the document loads by itself, such as images. Embeds that leave
+the archive are always `unresolved` unless the host allows outside resources
+(spec §9.6).
+
+## Build an archive
+
+```ts
+import { MdzPackagerCore } from '@mdzip/core-js';
+
+const { blob } = await MdzPackagerCore.buildArchive(
+	[
+		{ path: 'index.md', text: markdown },          // text for Markdown
+		{ path: 'images/photo.png', data: photoBytes }, // Uint8Array, ArrayBuffer or Blob
+	],
+	'My note',                                        // root name, used when no title is set
+	{
+		title: 'My note', entryPoint: 'index.md', createIndex: false, mapFiles: false, filters: ['**/*'],
+		application: { name: 'My Editor', version: '1.2.0', url: 'https://example.com' } // optional
+	}
+);
+```
+
+`createIndex`, `mapFiles` and `filters` are required. `filters` selects which
+input files go in: `['**/*']` keeps them all, and an empty list keeps none.
+The manifest is written for you. `application` records your app as
+`producer.application` (this library is always `producer.core`);
+`buildWorkspace()` takes the same option. Rewrite the document's image
+references to the archive paths yourself, percent-encoding spaces, `#`, `?`
+and `%`.
+
+`validate()` warns about any image a document uses that isn't in the archive,
+for example `index.md uses image "images/photo.png", which is not in the
+archive.`, so check its warnings after building.
+
+## Errors
+
+Errors are `MdzError`s (a subclass of `Error`) with the spec's error code in
+`code`. The message starts with the same code, for example
+`ERR_ENTRYPOINT_MISSING: manifest.json references "gone.md" which is not in
+the archive`.
+
+```ts
+import { MdzError } from '@mdzip/core-js';
+
+try {
+	await archive.resolveEntryPoint();
+} catch (error) {
+	if (error instanceof MdzError && error.code === 'ERR_ENTRYPOINT_MISSING') { /* … */ }
+}
+```
+
+A file that isn't a ZIP gives `ERR_ZIP_INVALID: The file is not a valid ZIP
+archive.`; the ZIP library's own message is in `error.cause`.
+`mdzErrorCode(error)` reads the code from any error, including ones from
+older versions that only had it in the message.
 
 ## Spec 1.2.0 behaviour
 
@@ -59,7 +150,7 @@ This release implements MDZip spec [1.2.0](https://github.com/mdzip-project/mdzi
 App shells and embedded editors can open an archive as a normalized workspace model:
 
 ```ts
-import { MdzArchiveCore, MdzPackagerCore } from 'mdzip-core-js';
+import { MdzArchiveCore, MdzPackagerCore } from '@mdzip/core-js';
 
 const workspace = await MdzArchiveCore.openWorkspace(fileOrArrayBuffer, {
 	includeOrphanedAssetAnalysis: true
@@ -91,7 +182,7 @@ Node-only export. Files are processed recursively and archive-relative paths are
 preserved.
 
 ```ts
-import { extractArchive, packDirectory } from 'mdzip-core-js/node';
+import { extractArchive, packDirectory } from '@mdzip/core-js/node';
 
 await packDirectory('./my-document', './my-document.mdz');
 await extractArchive('./my-document.mdz', './my-document');

@@ -17,6 +17,7 @@ import {
   type MdzPackInputFile,
   type MdzPackOptions
 } from './mdz-core.js';
+import { MdzError } from './spec.js';
 
 export type MdzNodeArchiveInput = MdzCoreArchiveBinary | string;
 
@@ -49,7 +50,7 @@ export async function packDirectory(
   const sourceRoot = path.resolve(sourceDirectory);
   const sourceStats = await lstat(sourceRoot);
   if (!sourceStats.isDirectory() || sourceStats.isSymbolicLink()) {
-    throw new Error(`ERR_PACK_SOURCE_NOT_DIRECTORY: "${sourceDirectory}" must be a real directory.`);
+    throw MdzError.fromMessage(`ERR_PACK_SOURCE_NOT_DIRECTORY: "${sourceDirectory}" must be a real directory.`);
   }
 
   const outputPath = outputFile ? path.resolve(outputFile) : null;
@@ -116,14 +117,14 @@ async function collectDirectoryFiles(
       continue;
     }
     if (entry.isSymbolicLink()) {
-      throw new Error(`ERR_PACK_SYMLINK: Symbolic links are not supported: "${absolutePath}".`);
+      throw MdzError.fromMessage(`ERR_PACK_SYMLINK: Symbolic links are not supported: "${absolutePath}".`);
     }
     if (entry.isDirectory()) {
       files.push(...await collectDirectoryFiles(sourceRoot, outputPath, absolutePath));
       continue;
     }
     if (!entry.isFile()) {
-      throw new Error(`ERR_PACK_UNSUPPORTED_ENTRY: Unsupported filesystem entry: "${absolutePath}".`);
+      throw MdzError.fromMessage(`ERR_PACK_UNSUPPORTED_ENTRY: Unsupported filesystem entry: "${absolutePath}".`);
     }
     files.push({
       path: path.relative(sourceRoot, absolutePath).split(path.sep).join('/'),
@@ -137,13 +138,13 @@ function planExtractionPath(destinationRoot: string, rawArchivePath: string): Pl
   const archivePath = MdzArchiveCore.normalizePath(rawArchivePath);
   const pathError = MdzArchiveCore.validateArchivePath(archivePath);
   if (pathError || !archivePath || path.isAbsolute(rawArchivePath) || /^[a-z]:/i.test(rawArchivePath)) {
-    throw new Error(`ERR_EXTRACT_UNSAFE_PATH: Unsafe archive path "${rawArchivePath}".`);
+    throw MdzError.fromMessage(`ERR_EXTRACT_UNSAFE_PATH: Unsafe archive path "${rawArchivePath}".`);
   }
 
   const targetPath = path.resolve(destinationRoot, ...archivePath.split('/'));
   const relativeTarget = path.relative(destinationRoot, targetPath);
   if (!relativeTarget || relativeTarget.startsWith('..') || path.isAbsolute(relativeTarget)) {
-    throw new Error(`ERR_EXTRACT_UNSAFE_PATH: Unsafe archive path "${rawArchivePath}".`);
+    throw MdzError.fromMessage(`ERR_EXTRACT_UNSAFE_PATH: Unsafe archive path "${rawArchivePath}".`);
   }
   return { archivePath, targetPath };
 }
@@ -153,7 +154,7 @@ function assertNoExtractionCollisions(planned: PlannedExtraction[]): void {
   for (const item of planned) {
     const key = normalizedFileKey(item.targetPath);
     if (targets.has(key)) {
-      throw new Error(`ERR_EXTRACT_PATH_COLLISION: Multiple entries resolve to "${item.archivePath}".`);
+      throw MdzError.fromMessage(`ERR_EXTRACT_PATH_COLLISION: Multiple entries resolve to "${item.archivePath}".`);
     }
     targets.add(key);
   }
@@ -168,13 +169,13 @@ async function preflightExtractionTargets(
     await assertSafeExistingPath(destinationRoot, path.dirname(item.targetPath));
     const stats = await tryLstat(item.targetPath);
     if (stats?.isSymbolicLink()) {
-      throw new Error(`ERR_EXTRACT_SYMLINK: Refusing to write through symbolic link "${item.targetPath}".`);
+      throw MdzError.fromMessage(`ERR_EXTRACT_SYMLINK: Refusing to write through symbolic link "${item.targetPath}".`);
     }
     if (stats?.isDirectory()) {
-      throw new Error(`ERR_EXTRACT_TARGET_DIRECTORY: File target is a directory: "${item.targetPath}".`);
+      throw MdzError.fromMessage(`ERR_EXTRACT_TARGET_DIRECTORY: File target is a directory: "${item.targetPath}".`);
     }
     if (stats && !overwrite) {
-      throw new Error(`ERR_EXTRACT_TARGET_EXISTS: File already exists: "${item.targetPath}".`);
+      throw MdzError.fromMessage(`ERR_EXTRACT_TARGET_EXISTS: File already exists: "${item.targetPath}".`);
     }
   }
 }
@@ -182,10 +183,10 @@ async function preflightExtractionTargets(
 async function ensureExtractionRoot(destinationRoot: string): Promise<void> {
   const existing = await tryLstat(destinationRoot);
   if (existing?.isSymbolicLink()) {
-    throw new Error(`ERR_EXTRACT_SYMLINK: Destination cannot be a symbolic link: "${destinationRoot}".`);
+    throw MdzError.fromMessage(`ERR_EXTRACT_SYMLINK: Destination cannot be a symbolic link: "${destinationRoot}".`);
   }
   if (existing && !existing.isDirectory()) {
-    throw new Error(`ERR_EXTRACT_TARGET_NOT_DIRECTORY: Destination is not a directory: "${destinationRoot}".`);
+    throw MdzError.fromMessage(`ERR_EXTRACT_TARGET_NOT_DIRECTORY: Destination is not a directory: "${destinationRoot}".`);
   }
   await mkdir(destinationRoot, { recursive: true });
   await realpath(destinationRoot);
@@ -201,10 +202,10 @@ async function assertSafeExistingPath(destinationRoot: string, directory: string
     current = path.join(current, segment);
     const stats = await tryLstat(current);
     if (stats?.isSymbolicLink()) {
-      throw new Error(`ERR_EXTRACT_SYMLINK: Refusing to traverse symbolic link "${current}".`);
+      throw MdzError.fromMessage(`ERR_EXTRACT_SYMLINK: Refusing to traverse symbolic link "${current}".`);
     }
     if (stats && !stats.isDirectory()) {
-      throw new Error(`ERR_EXTRACT_PARENT_NOT_DIRECTORY: Parent path is not a directory: "${current}".`);
+      throw MdzError.fromMessage(`ERR_EXTRACT_PARENT_NOT_DIRECTORY: Parent path is not a directory: "${current}".`);
     }
   }
 }
@@ -216,10 +217,10 @@ async function ensureSafeDirectoryPath(destinationRoot: string, directory: strin
     current = path.join(current, segment);
     const stats = await tryLstat(current);
     if (stats?.isSymbolicLink()) {
-      throw new Error(`ERR_EXTRACT_SYMLINK: Refusing to traverse symbolic link "${current}".`);
+      throw MdzError.fromMessage(`ERR_EXTRACT_SYMLINK: Refusing to traverse symbolic link "${current}".`);
     }
     if (stats && !stats.isDirectory()) {
-      throw new Error(`ERR_EXTRACT_PARENT_NOT_DIRECTORY: Parent path is not a directory: "${current}".`);
+      throw MdzError.fromMessage(`ERR_EXTRACT_PARENT_NOT_DIRECTORY: Parent path is not a directory: "${current}".`);
     }
     if (!stats) {
       await mkdir(current);

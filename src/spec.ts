@@ -21,13 +21,35 @@ export interface MdzCodedProblem {
   message: string;
 }
 
-/** Throws `Error("CODE: message")`. */
-export function mdzError(code: string, message: string): Error {
-  return new Error(`${code}: ${message}`);
+/**
+ * An error with a spec error code (§16.5), such as `ERR_ENTRYPOINT_MISSING`, in `code`. The
+ * message still starts with the code (`"ERR_ENTRYPOINT_MISSING: …"`), as it always has, so code
+ * that reads the message keeps working.
+ */
+export class MdzError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string, options?: { cause?: unknown }) {
+    super(`${code}: ${message}`, options);
+    this.name = 'MdzError';
+    this.code = code;
+  }
+
+  /** An `MdzError` from a `"CODE: message"` string. */
+  static fromMessage(text: string, options?: { cause?: unknown }): MdzError {
+    const match = /^(ERR_[A-Z0-9_]+):\s*([\s\S]*)$/.exec(text);
+    return match ? new MdzError(match[1]!, match[2]!, options) : new MdzError('ERR_UNKNOWN', text, options);
+  }
 }
 
-/** The spec error code at the start of an error message, or null. */
+/** An `MdzError` with message `"CODE: message"`. */
+export function mdzError(code: string, message: string, options?: { cause?: unknown }): MdzError {
+  return new MdzError(code, message, options);
+}
+
+/** The spec error code of an error: its `code`, else the code at the start of its message, or null. */
 export function mdzErrorCode(error: unknown): string | null {
+  if (error instanceof MdzError) return error.code;
   const message = error instanceof Error ? error.message : String(error ?? '');
   const match = /^(ERR_[A-Z0-9_]+)\b/.exec(message);
   return match ? match[1]! : null;

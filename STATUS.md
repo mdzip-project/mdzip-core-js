@@ -1,5 +1,5 @@
-Status: idle
-Last:   Released v2.0.1: updateFiles records entryPoint in a manifest that lacks one; npm + GitHub release (2026-10-14)
+Status: ready-to-commit
+Last:   Fix: updateFiles can remove directory entries (folder/); test added, 84/84 pass — needed by mdzip-obsidian folder delete/move; release as 2.0.2 before the plugin ships
 
 Owner to-do (review/commit/release steps): ../planning/owner-todo.md
 
