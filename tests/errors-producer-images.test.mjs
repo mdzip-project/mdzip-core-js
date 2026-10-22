@@ -122,3 +122,11 @@ test('an archive with every image present has no image warnings', async () => {
   ]);
   assert.deepEqual((await MdzArchiveCore.validate(bytes)).warnings, []);
 });
+
+test('validate({ checkImages: false }) and openWorkspace skip the image check', async () => {
+  const bytes = await pack([{ path: 'index.md', text: '![gone](images/gone.png)\n' }]);
+  assert.equal((await MdzArchiveCore.validate(bytes)).warnings.length, 1);
+  assert.deepEqual((await MdzArchiveCore.validate(bytes, undefined, { checkImages: false })).warnings, []);
+  const workspace = await MdzArchiveCore.openWorkspace(bytes);
+  assert.deepEqual(workspace.validation.warnings, []);
+});

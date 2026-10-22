@@ -27,7 +27,7 @@ import {
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = MDZ_SPEC_VERSION;
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '2.1.0';
+const CORE_LIBRARY_VERSION = '2.1.1';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
@@ -332,6 +332,18 @@ export interface MdzValidationResult {
   errors: string[];
   /** Non-fatal advisory findings discovered during validation. */
   warnings: string[];
+}
+
+/**
+ * Controls for {@link MdzArchiveCore.validate}.
+ */
+export interface MdzValidateOptions {
+  /**
+   * Also check that every image a Markdown document uses is in the archive (a warning per
+   * missing image). This reads every Markdown file, so it costs time on large archives.
+   * Default `true`. `openWorkspace()` skips it so documents can stay unread until opened.
+   */
+  checkImages?: boolean;
 }
 
 /**
@@ -756,10 +768,11 @@ export class MdzArchiveCore {
    *
    * @param input - Raw archive bytes.
    * @param zipFactory - Optional custom zip loader.
+   * @param options - Validation controls (see {@link MdzValidateOptions}).
    */
-  public static async validate(input: MdzCoreArchiveBinary, zipFactory?: ZipFactoryLike): Promise<MdzValidationResult> {
+  public static async validate(input: MdzCoreArchiveBinary, zipFactory?: ZipFactoryLike, options?: MdzValidateOptions): Promise<MdzValidationResult> {
     const archive = await MdzArchiveCore.open(input, zipFactory);
-    return archive.validate();
+    return archive.validate(options);
   }
 
   /**
@@ -1865,7 +1878,8 @@ export class MdzArchiveCore {
    * @param options - Workspace open controls.
    */
   public async openWorkspace(options?: MdzOpenWorkspaceOptions): Promise<MdzWorkspace> {
-    const validation = await this.validate();
+    // Without the image check, which would read every document and defeat lazy opening.
+    const validation = await this.validate({ checkImages: false });
     const manifest = await this.readManifest().catch(() => null);
     const mode = await this.resolveMode().catch((): MdzManifestMode => 'document');
     const entryPoint = await this.resolveEntryPoint().catch(() => null);
@@ -2012,7 +2026,7 @@ export class MdzArchiveCore {
    * skipped (§4, §13.1); ignored descriptive manifest fields and duplicate members (§6.4); a
    * missing `cover`; and missing version metadata.
    */
-  public async validate(): Promise<MdzValidationResult> {
+  public async validate(options?: MdzValidateOptions): Promise<MdzValidationResult> {
     const errors: string[] = [];
     const warnings: string[] = [];
 
@@ -2072,7 +2086,7 @@ export class MdzArchiveCore {
       }
     }
 
-    warnings.push(...await this.missingImageWarnings());
+    if (options?.checkImages !== false) warnings.push(...await this.missingImageWarnings());
 
     return {
       isValid: errors.length === 0,
