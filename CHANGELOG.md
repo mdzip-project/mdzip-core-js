@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.2] - 2026-10-25
+
+### Fixed
+- `extractImageReferences()` ignores image examples inside inline code spans,
+  backtick/tilde fenced code blocks and indented code blocks (#8). Validation
+  no longer warns about those examples, and orphan analysis no longer counts
+  them as used images or unresolved references.
+
 ## [2.1.1] - 2026-10-22
 
 ### Fixed

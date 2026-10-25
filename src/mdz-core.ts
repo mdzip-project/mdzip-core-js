@@ -27,7 +27,7 @@ import {
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = MDZ_SPEC_VERSION;
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '2.1.1';
+const CORE_LIBRARY_VERSION = '2.1.2';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 /**
@@ -2208,7 +2208,8 @@ export class MdzArchiveCore {
 
   /**
    * Extracts every image reference target found in a block of Markdown text,
-   * from both `![alt](target)` syntax and raw `<img src="target">` HTML tags
+   * from both `![alt](target)` syntax and raw `<img src="target">` HTML tags,
+   * ignoring fenced/indented code blocks and inline code spans
    * (used for sizing/alignment control Markdown syntax can't express).
    * Targets are returned raw/unresolved — relative to whatever base the
    * caller's markdown lives at — with surrounding `<...>` wrapping and
@@ -2222,6 +2223,7 @@ export class MdzArchiveCore {
    * time, leaving other independent copies elsewhere still `![]()`-only.
    */
   static extractImageReferences(markdown: string): string[] {
+    markdown = MdzArchiveCore.maskMarkdownCode(markdown);
     const refs: string[] = [];
     const mdRe = new RegExp(MdzArchiveCore.MARKDOWN_IMAGE_REF_RE.source, 'g');
     let match: RegExpExecArray | null;
@@ -2241,6 +2243,76 @@ export class MdzArchiveCore {
     }
 
     return refs;
+  }
+
+  /** Hide code before scanning images, preserving newlines and source positions. */
+  private static maskMarkdownCode(markdown: string): string {
+    const blank = (text: string) => text.replace(/[^\r\n]/g, ' ');
+    let fence: string | undefined;
+    let indented = false;
+    let paragraph = false;
+    const blocks = markdown.split(/(?<=\n)/).map(line => {
+      const content = line.replace(/[\r\n]+$/, '');
+      if (fence) {
+        const close = /^ {0,3}(`+|~+)[ \t]*$/.exec(content);
+        if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = undefined;
+        return blank(line);
+      }
+      const open = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(content);
+      if (open && (open[1][0] !== '`' || !open[2].includes('`'))) {
+        fence = open[1];
+        paragraph = false;
+        indented = false;
+        return blank(line);
+      }
+      if (/^[ \t]*$/.test(content)) {
+        paragraph = false;
+        return line;
+      }
+      // Indented code cannot interrupt an existing paragraph.
+      if (/^(?: {4}| {0,3}\t)/.test(content) && (indented || !paragraph)) {
+        indented = true;
+        return blank(line);
+      }
+      indented = false;
+      paragraph = true;
+      return line;
+    }).join('');
+
+    // Exact-length backtick runs delimit spans; shorter runs are literal content.
+    // Pre-index matching runs instead of searching forward for each opener.
+    const runs = [...blocks.matchAll(/`+/g)];
+    const next = new Map<number, number>();
+    const closing = new Map<number, number>();
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const length = runs[i][0].length;
+      const following = next.get(length);
+      if (following !== undefined) closing.set(i, following);
+      next.set(length, i);
+    }
+    const pieces: string[] = [];
+    const tags = [...blocks.matchAll(/<[A-Za-z/](?:[^>"']|"[^"]*"|'[^']*')*>/g)];
+    let tagIndex = 0;
+    let copied = 0;
+    for (let i = 0; i < runs.length; i++) {
+      const start = runs[i].index!;
+      // Backticks in a real HTML attribute are literal, not Markdown delimiters.
+      while (tagIndex < tags.length && tags[tagIndex].index! + tags[tagIndex][0].length <= start) tagIndex++;
+      if (tagIndex < tags.length && tags[tagIndex].index! <= start) continue;
+      let slashes = 0;
+      for (let p = start - 1; p >= 0 && blocks[p] === '\\'; p--) slashes++;
+      if (slashes % 2) continue;
+      const endRun = closing.get(i);
+      if (endRun === undefined) continue;
+      const end = runs[endRun].index! + runs[endRun][0].length;
+      // A code span cannot cross a blank line (a paragraph boundary).
+      if (/\r?\n[ \t]*\r?\n/.test(blocks.slice(start, end))) continue;
+      pieces.push(blocks.slice(copied, start), blank(blocks.slice(start, end)));
+      copied = end;
+      i = endRun;
+    }
+    pieces.push(blocks.slice(copied));
+    return pieces.join('');
   }
 
   private static cleanMarkdownLinkTarget(raw: string): string {
