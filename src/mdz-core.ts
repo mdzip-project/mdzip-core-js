@@ -2,7 +2,7 @@ import JSZip from '@progress/jszip-esm';
 // fflate's `deflateSync`/`inflateSync` are already raw DEFLATE (no zlib/gzip
 // wrapper) — the naming is fflate's own convention, not a mismatch with the
 // 'deflate-raw' this replaces; the wrapped variants are `zlibSync`/`gzipSync`.
-import { deflateSync } from 'fflate';
+import { deflateSync, Inflate } from 'fflate';
 import {
   MDZ_SPEC_VERSION,
   asciiLower,
@@ -29,6 +29,21 @@ const PRODUCER_SPEC_VERSION = MDZ_SPEC_VERSION;
 // Must match package.json "version" â€” guarded by a unit test.
 const CORE_LIBRARY_VERSION = '2.1.2';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
+
+// Built-in resource limits against ZIP bombs (§13.1, core contract R7). Fixed defaults, no looser
+// than the reference limits of the spec's T-018 fixtures (resource-limit-cases.json).
+
+/** Most entries an archive may have. */
+export const MDZ_MAX_ENTRIES = 100_000;
+/** Largest uncompressed size of one entry, in bytes (1 GiB). */
+export const MDZ_MAX_ENTRY_UNCOMPRESSED_BYTES = 1024 ** 3;
+/** Largest total uncompressed size of all entries, in bytes (4 GiB). */
+export const MDZ_MAX_TOTAL_UNCOMPRESSED_BYTES = 4 * 1024 ** 3;
+/** Highest uncompressed-to-compressed ratio of an entry larger than 1 MiB. */
+export const MDZ_MAX_COMPRESSION_RATIO = 1000;
+const COMPRESSION_RATIO_APPLIES_ABOVE_BYTES = 1024 * 1024;
+/** Compressed bytes inflated per step, so a bomb is stopped after at most ~1000x this much output. */
+const INFLATE_STEP_BYTES = 8192;
 
 /**
  * Binary input accepted for opening an existing `.mdz` archive.
@@ -696,6 +711,8 @@ export class MdzArchiveCore {
     if (zipFactory) {
       const zip = await MdzArchiveCore.loadOrThrowZipInvalid(() => factory.loadAsync(input));
       MdzArchiveCore.checkEntryNames(Object.keys(zip.files));
+      // A custom ZIP library owns decompression, so only the entry count can be checked here.
+      MdzArchiveCore.checkEntryCount(Object.keys(zip.files).length);
       return new MdzArchiveCore(zip);
     }
 
@@ -711,6 +728,8 @@ export class MdzArchiveCore {
           throw mdzError('ERR_ZIP_INVALID', `entry '${entry.name}' uses compression method ${entry.method}; MDZip allows 0 (stored) and 8 (DEFLATE) (§4)`);
         }
       }
+      MdzArchiveCore.checkResourceLimits(raw);
+      MdzArchiveCore.checkCentralDirectoryVisible(raw, zip);
       names = raw.map((entry) => entry.name);
     } catch (error) {
       if (!(error instanceof Error) || !error.message.startsWith('ERR_ZIP_UNSUPPORTED')) throw error;
@@ -728,6 +747,57 @@ export class MdzArchiveCore {
       // The ZIP library's own text ("Can't find end of central directory : is this a zip
       // file ? …") is kept as the cause, not shown to users.
       throw mdzError('ERR_ZIP_INVALID', 'The file is not a valid ZIP archive.', { cause: error });
+    }
+  }
+
+  private static checkEntryCount(count: number): void {
+    if (count > MDZ_MAX_ENTRIES) {
+      throw mdzError('ERR_LIMIT_EXCEEDED', `The archive has ${count} entries (limit ${MDZ_MAX_ENTRIES}).`);
+    }
+  }
+
+  /**
+   * Rejects an archive whose declared sizes exceed the built-in limits (`ERR_LIMIT_EXCEEDED`, §13.1),
+   * before anything is decompressed. Actual sizes are checked again on every read, since declared
+   * sizes can lie.
+   */
+  private static checkResourceLimits(raw: Array<{ name: string; compressedSize: number; uncompressedSize: number }>): void {
+    MdzArchiveCore.checkEntryCount(raw.length);
+    let total = 0;
+    for (const entry of raw) {
+      if (entry.name.endsWith('/')) continue;
+      const size = entry.uncompressedSize;
+      if (size > MDZ_MAX_ENTRY_UNCOMPRESSED_BYTES) {
+        throw mdzError('ERR_LIMIT_EXCEEDED', `'${entry.name}' is ${size} bytes (limit ${MDZ_MAX_ENTRY_UNCOMPRESSED_BYTES}).`);
+      }
+      if (size > COMPRESSION_RATIO_APPLIES_ABOVE_BYTES && entry.compressedSize > 0
+        && size / entry.compressedSize > MDZ_MAX_COMPRESSION_RATIO) {
+        throw mdzError('ERR_LIMIT_EXCEEDED',
+          `'${entry.name}' has compression ratio ${Math.round(size / entry.compressedSize)}:1 (limit ${MDZ_MAX_COMPRESSION_RATIO}:1).`);
+      }
+      total += size;
+      if (total > MDZ_MAX_TOTAL_UNCOMPRESSED_BYTES) {
+        throw mdzError('ERR_LIMIT_EXCEEDED', `The archive's total uncompressed size exceeds ${MDZ_MAX_TOTAL_UNCOMPRESSED_BYTES} bytes.`);
+      }
+    }
+  }
+
+  /**
+   * The central directory governs (§4): every entry it lists must be one JSZip exposes, and no two
+   * may share data. Otherwise entries would be hidden silently (`ERR_ZIP_INVALID`).
+   */
+  private static checkCentralDirectoryVisible(raw: Array<{ name: string; localOffset: number }>, zip: ZipLike): void {
+    const visible = new Set(Object.keys(zip.files).map((name) => MdzArchiveCore.normalizePath(name)));
+    const offsets = new Map<number, string>();
+    for (const entry of raw) {
+      const other = offsets.get(entry.localOffset);
+      if (other !== undefined) {
+        throw mdzError('ERR_ZIP_INVALID', `'${entry.name}' and '${other}' share the same data in the archive.`);
+      }
+      offsets.set(entry.localOffset, entry.name);
+      if (!visible.has(entry.name)) {
+        throw mdzError('ERR_ZIP_INVALID', `'${entry.name}' is in the central directory but can't be read.`);
+      }
     }
   }
 
@@ -882,7 +952,7 @@ export class MdzArchiveCore {
     }
 
     const changing = normalizedWrites.size > 0 || normalizedRemovals.size > 0;
-    const existingManifest = await MdzArchiveCore.readExistingManifestObject(archive.zip, changing);
+    const existingManifest = await MdzArchiveCore.readExistingManifestObject(archive, changing);
     const entryPointBefore = MdzPackagerCore.resolveEntryPoint(existingPaths, existingManifest);
 
     // Resolve the manifest entry to write: explicit write > options.manifest > existing refresh
@@ -1759,8 +1829,7 @@ export class MdzArchiveCore {
    * @param path - Archive-relative file path.
    */
   public async readText(path: string): Promise<string> {
-    const entry = this.getFileEntryOrThrow(path);
-    return String(await entry.async('text'));
+    return this.readEntryText(this.getFileEntryOrThrow(path));
   }
 
   /**
@@ -1769,9 +1838,7 @@ export class MdzArchiveCore {
    * @param path - Archive-relative file path.
    */
   public async readBytes(path: string): Promise<Uint8Array> {
-    const entry = this.getFileEntryOrThrow(path);
-    const out = await entry.async('arraybuffer');
-    return new Uint8Array(out as ArrayBuffer);
+    return this.readEntryData(this.getFileEntryOrThrow(path));
   }
 
   /**
@@ -1780,8 +1847,105 @@ export class MdzArchiveCore {
    * @param path - Archive-relative file path.
    */
   public async readBase64(path: string): Promise<string> {
-    const entry = this.getFileEntryOrThrow(path);
-    return String(await entry.async('base64'));
+    const bytes = await this.readEntryData(this.getFileEntryOrThrow(path));
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary);
+  }
+
+  /** Central directory records by normalized name, from the raw bytes; null when unavailable. */
+  private rawEntryIndex: Map<string, ReturnType<typeof MdzArchiveCore.parseRawZipEntries>[number]> | null | undefined;
+
+  private getRawEntry(name: string): ReturnType<typeof MdzArchiveCore.parseRawZipEntries>[number] | undefined {
+    if (this.rawEntryIndex === undefined) {
+      this.rawEntryIndex = null;
+      if (this.rawBytes) {
+        try {
+          this.rawEntryIndex = new Map(MdzArchiveCore.parseRawZipEntries(this.rawBytes).map((e) => [e.name, e]));
+        } catch (error) {
+          if (!(error instanceof Error) || !error.message.startsWith('ERR_ZIP_UNSUPPORTED')) throw error;
+        }
+      }
+    }
+    return this.rawEntryIndex?.get(MdzArchiveCore.normalizePath(name));
+  }
+
+  /**
+   * An entry's bytes. Decompressed from the archive bytes when they're available, stopping at the
+   * declared size and checking the CRC-32: data past the declared size is `ERR_LIMIT_EXCEEDED`;
+   * short, mismatched or undecompressable data is `ERR_ZIP_INVALID` (§13.1). Never returns corrupt
+   * data as success. Archives opened with a custom ZIP factory are read through it.
+   */
+  private async readEntryData(entry: ZipEntry): Promise<Uint8Array> {
+    const raw = this.getRawEntry(entry.name);
+    if (raw && this.rawBytes) {
+      return MdzArchiveCore.inflateEntryChecked(this.rawBytes, raw);
+    }
+    try {
+      return new Uint8Array((await entry.async('arraybuffer')) as ArrayBuffer);
+    } catch (error) {
+      throw mdzError('ERR_ZIP_INVALID', `'${entry.name}' is corrupt.`, { cause: error });
+    }
+  }
+
+  /** An entry's UTF-8 text, checked as {@link readEntryData} describes. A leading BOM is kept. */
+  private async readEntryText(entry: ZipEntry): Promise<string> {
+    return new TextDecoder('utf-8', { ignoreBOM: true }).decode(await this.readEntryData(entry));
+  }
+
+  private static inflateEntryChecked(
+    source: Uint8Array,
+    raw: { name: string; method: number; crc: number; compressedSize: number; uncompressedSize: number; localOffset: number }
+  ): Uint8Array {
+    const corrupt = (detail: string, cause?: unknown) =>
+      mdzError('ERR_ZIP_INVALID', `'${raw.name}' is corrupt: ${detail}.`, cause === undefined ? undefined : { cause });
+    const view = new DataView(source.buffer, source.byteOffset, source.byteLength);
+    const local = raw.localOffset;
+    if (local + 30 > source.length || view.getUint32(local, true) !== 0x04034b50) {
+      throw corrupt('its local header is missing');
+    }
+    const start = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
+    const end = start + raw.compressedSize;
+    if (end > source.length) throw corrupt('its data runs past the end of the archive');
+    const compressed = source.subarray(start, end);
+    const declared = raw.uncompressedSize;
+
+    let out: Uint8Array;
+    if (raw.method === 0) {
+      if (compressed.length !== declared) throw corrupt('its stored size does not match its declared size');
+      out = compressed.slice();
+    } else {
+      const buffer = new Uint8Array(declared);
+      out = buffer;
+      let filled = 0;
+      let overflow = false;
+      const inflater = new Inflate((chunk) => {
+        if (filled + chunk.length > declared) {
+          overflow = true;
+          throw new Error('overflow');
+        }
+        buffer.set(chunk, filled);
+        filled += chunk.length;
+      });
+      try {
+        let offset = 0;
+        do {
+          const next = Math.min(offset + INFLATE_STEP_BYTES, compressed.length);
+          inflater.push(compressed.subarray(offset, next), next >= compressed.length);
+          offset = next;
+        } while (offset < compressed.length);
+      } catch (error) {
+        if (overflow) {
+          throw mdzError('ERR_LIMIT_EXCEEDED', `'${raw.name}' decompresses to more than its declared size.`);
+        }
+        throw corrupt('its compressed data is invalid', error);
+      }
+      if (filled !== declared) throw corrupt('it decompresses to less than its declared size');
+    }
+    if (MdzArchiveCore.crc32(out) !== raw.crc >>> 0) throw corrupt('its checksum does not match');
+    return out;
   }
 
   /**
@@ -1990,7 +2154,7 @@ export class MdzArchiveCore {
       return null;
     }
 
-    const { manifest, duplicateMembers } = parseManifestText(String(await entry.async('text')));
+    const { manifest, duplicateMembers } = parseManifestText(await this.readEntryText(entry));
     const ignoredFields = checkManifest(manifest);
     MdzArchiveCore.checkLegacyMdzField(manifest);
 
@@ -2359,11 +2523,11 @@ export class MdzArchiveCore {
     return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   }
 
-  private static async readExistingManifestObject(zip: ZipLike, requireValid: boolean): Promise<Record<string, unknown> | null> {
-    const manifestEntry = Object.entries(zip.files).find(([p, entry]) => MdzArchiveCore.normalizePath(p) === 'manifest.json' && !entry.dir)?.[1];
+  private static async readExistingManifestObject(archive: MdzArchiveCore, requireValid: boolean): Promise<Record<string, unknown> | null> {
+    const manifestEntry = Object.entries(archive.zip.files).find(([p, entry]) => MdzArchiveCore.normalizePath(p) === 'manifest.json' && !entry.dir)?.[1];
     if (!manifestEntry) return null;
 
-    const raw = await manifestEntry.async('text');
+    const raw = await archive.readEntryText(manifestEntry);
     try {
       const parsed = JSON.parse(String(raw));
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {

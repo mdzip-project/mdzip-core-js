@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Built-in ZIP-bomb limits (§13.1, #10): `open()` rejects an archive with more than 100,000
+  entries, an entry over 1 GiB, more than 4 GiB in total, or an entry over 1 MiB compressed
+  more than 1000:1, with `ERR_LIMIT_EXCEEDED`. Exported as `MDZ_MAX_ENTRIES`,
+  `MDZ_MAX_ENTRY_UNCOMPRESSED_BYTES`, `MDZ_MAX_TOTAL_UNCOMPRESSED_BYTES` and
+  `MDZ_MAX_COMPRESSION_RATIO`; not configurable.
+- Spec fixtures synced to `v1.2.1`, with tests for T-018 (ZIP-bomb limits).
+
+### Fixed
+- Reads (`readText`, `readBytes`, `readBase64`, manifest reads, workspace documents and assets)
+  now decompress from the archive bytes, stopping at the declared size and checking the
+  CRC-32. Before, an entry that expanded past its declared size was fully decompressed and
+  then failed with JSZip's own message and no code; a high-ratio entry was read in full. Data
+  past the declared size is now `ERR_LIMIT_EXCEEDED`; short, mismatched or undecompressable
+  data is `ERR_ZIP_INVALID`.
+- `open()` no longer hides central directory entries JSZip can't expose (for example several
+  entries pointing at the same data): such an archive is `ERR_ZIP_INVALID`, since the central
+  directory governs (§4).
+
 ## [2.1.2] - 2026-10-25
 
 ### Fixed

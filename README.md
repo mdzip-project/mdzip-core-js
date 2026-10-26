@@ -135,10 +135,12 @@ older versions that only had it in the message.
 
 ## Spec 1.2.0 behaviour
 
-This release implements MDZip spec [1.2.0](https://github.com/mdzip-project/mdzip-spec/releases/tag/v1.2.0) and runs its shared fixtures (`tests/fixtures`, synced with `mdzip-spec/tools/sync-fixtures.mjs --ref v1.2.0`). Things to know when upgrading:
+This release implements MDZip spec [1.2.0](https://github.com/mdzip-project/mdzip-spec/releases/tag/v1.2.0) and runs its shared fixtures (`tests/fixtures`, synced with `mdzip-spec/tools/sync-fixtures.mjs --ref v1.2.1`). Things to know when upgrading:
 
 - **Paths are case-sensitive** after Unicode NFC normalization (§5.4.1): `Index.md` no longer finds `index.md`. Use `archive.findCaseOnlyMatch(path)` to suggest the near match after a failed lookup.
 - **Entry names are checked on open**: two entries equal after NFC (`ERR_DUPLICATE_PATH`) or a file that is also a directory (`ERR_PATH_CONFLICT`) make `open()` throw; a compression method other than stored/DEFLATE is `ERR_ZIP_INVALID`.
+- **ZIP-bomb limits** (§13.1): `open()` rejects an archive with more than `MDZ_MAX_ENTRIES` (100,000) entries, an entry over `MDZ_MAX_ENTRY_UNCOMPRESSED_BYTES` (1 GiB), more than `MDZ_MAX_TOTAL_UNCOMPRESSED_BYTES` (4 GiB) in total, or an entry over 1 MiB compressed more than `MDZ_MAX_COMPRESSION_RATIO` (1000:1), with `ERR_LIMIT_EXCEEDED`. The limits are fixed. An archive whose central directory lists entries that can't be read, or that share data, is `ERR_ZIP_INVALID`.
+- **Reads are verified**: `readText`, `readBytes`, `readBase64` and everything built on them stop at the entry's declared size and check its CRC-32. Data past the declared size is `ERR_LIMIT_EXCEEDED`; short, mismatched or undecompressable data is `ERR_ZIP_INVALID`. With a custom `zipFactory`, decompression is that library's job and only the entry count is limited.
 - **Symbolic link entries** are skipped and never followed: they're not in `listPaths()`, can't be read, are listed by `listSpecialFiles()` and reported by `validate()`. Mutations keep them unless `dropSpecialFiles: true`.
 - **Manifests**: an invalid critical field (`spec`, `spec.version`, `mode`, `entryPoint`) throws; an invalid descriptive field is left out of `readManifest()` and reported by `validate()`. `null` counts as a wrong type.
 - **Producers always write `manifest.json`** with `spec.version` `1.2.0`, `entryPoint`, `title` and `mode`, and never write `null` placeholders. `updateFiles()` adds a manifest to an archive without one, keeps every existing manifest field, and throws `ERR_ENTRYPOINT_CHANGED` if a change would move the entry point (set `entryPoint` in the manifest to move it on purpose).
