@@ -27,7 +27,7 @@ import {
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = MDZ_SPEC_VERSION;
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '2.1.2';
+const CORE_LIBRARY_VERSION = '2.2.0';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 // Built-in resource limits against ZIP bombs (§13.1, core contract R7). Fixed defaults, no looser

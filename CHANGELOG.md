@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.2.0] - 2026-10-26
 
 ### Added
 - Built-in ZIP-bomb limits (§13.1, #10): `open()` rejects an archive with more than 100,000
