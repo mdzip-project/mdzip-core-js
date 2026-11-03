@@ -27,7 +27,7 @@ import {
 type MdzCoreZipAsyncKind = 'text' | 'base64' | 'arraybuffer';
 const PRODUCER_SPEC_VERSION = MDZ_SPEC_VERSION;
 // Must match package.json "version" â€” guarded by a unit test.
-const CORE_LIBRARY_VERSION = '2.2.0';
+const CORE_LIBRARY_VERSION = '2.2.1';
 const CORE_LIBRARY_URL = 'https://github.com/mdzip-project/mdzip-core-js';
 
 // Built-in resource limits against ZIP bombs (§13.1, core contract R7). Fixed defaults, no looser
@@ -2409,14 +2409,69 @@ export class MdzArchiveCore {
     return refs;
   }
 
-  /** Hide code before scanning images, preserving newlines and source positions. */
+  // CommonMark HTML blocks (spec section 4.6). Markdown inside one is raw
+  // HTML, never an image, but an <img src> there still is one (#11).
+  // Conditions 1-5 end on the line matching `end`; 6 and 7 at a blank line.
+  private static readonly HTML_BLOCK_STARTS: ReadonlyArray<{ start: RegExp; end?: RegExp; interruptsParagraph: boolean }> = [
+    { start: /^ {0,3}<(?:pre|script|style|textarea)(?:[\s>]|$)/i, end: /<\/(?:pre|script|style|textarea)>/i, interruptsParagraph: true },
+    { start: /^ {0,3}<!--/, end: /-->/, interruptsParagraph: true },
+    { start: /^ {0,3}<\?/, end: /\?>/, interruptsParagraph: true },
+    { start: /^ {0,3}<![A-Za-z]/, end: />/, interruptsParagraph: true },
+    { start: /^ {0,3}<!\[CDATA\[/, end: /\]\]>/, interruptsParagraph: true },
+    {
+      start: /^ {0,3}<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[\s>]|\/>|$)/i,
+      interruptsParagraph: true
+    },
+    {
+      start: /^ {0,3}(?:<(?!(?:pre|script|style|textarea)[\s/>])[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:][\w.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>|<\/[A-Za-z][A-Za-z0-9-]*\s*>)[ \t]*$/i,
+      interruptsParagraph: false
+    }
+  ];
+
+  /** Hide code, and Markdown image syntax in HTML blocks, before scanning images, preserving newlines and source positions. */
   private static maskMarkdownCode(markdown: string): string {
     const blank = (text: string) => text.replace(/[^\r\n]/g, ' ');
+    const blankMarkdownImages = (text: string) =>
+      text.replace(new RegExp(MdzArchiveCore.MARKDOWN_IMAGE_REF_RE.source, 'g'), blank);
     let fence: string | undefined;
     let indented = false;
     let paragraph = false;
+    // The open HTML block: its end pattern, or null for one that ends at a blank line.
+    let html: RegExp | null | undefined;
+    // Source ranges of HTML block lines: backticks there aren't code spans.
+    const htmlRanges: Array<[number, number]> = [];
+    let offset = 0;
+    const inHtmlBlock = (line: string): string => {
+      htmlRanges.push([offset, offset + line.length]);
+      return blankMarkdownImages(line);
+    };
     const blocks = markdown.split(/(?<=\n)/).map(line => {
       const content = line.replace(/[\r\n]+$/, '');
+      try {
+        return maskLine(line, content);
+      } finally {
+        offset += line.length;
+      }
+    }).join('');
+
+    function maskLine(line: string, content: string): string {
+      if (html !== undefined) {
+        if (html === null) {
+          if (/^[ \t]*$/.test(content)) {
+            html = undefined;
+            paragraph = false;
+            return line;
+          }
+        } else if (html.test(content)) {
+          html = undefined;
+          paragraph = false;
+        }
+        return inHtmlBlock(line);
+      }
+      return maskMarkdownLine(line, content);
+    }
+
+    function maskMarkdownLine(line: string, content: string): string {
       if (fence) {
         const close = /^ {0,3}(`+|~+)[ \t]*$/.exec(content);
         if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = undefined;
@@ -2439,13 +2494,27 @@ export class MdzArchiveCore {
         return blank(line);
       }
       indented = false;
+      for (const kind of MdzArchiveCore.HTML_BLOCK_STARTS) {
+        if (paragraph && !kind.interruptsParagraph) continue;
+        const start = kind.start.exec(content);
+        if (!start) continue;
+        // Conditions 1-5 can end on their opening line.
+        html = kind.end && kind.end.test(content.slice(start[0].length)) ? undefined : (kind.end ?? null);
+        paragraph = false;
+        return inHtmlBlock(line);
+      }
       paragraph = true;
       return line;
-    }).join('');
+    }
 
     // Exact-length backtick runs delimit spans; shorter runs are literal content.
     // Pre-index matching runs instead of searching forward for each opener.
-    const runs = [...blocks.matchAll(/`+/g)];
+    // Both lists are in source order, so one pass drops the runs in HTML blocks.
+    let rangeIndex = 0;
+    const runs = [...blocks.matchAll(/`+/g)].filter(run => {
+      while (rangeIndex < htmlRanges.length && htmlRanges[rangeIndex][1] <= run.index!) rangeIndex++;
+      return rangeIndex >= htmlRanges.length || htmlRanges[rangeIndex][0] > run.index!;
+    });
     const next = new Map<number, number>();
     const closing = new Map<number, number>();
     for (let i = runs.length - 1; i >= 0; i--) {

@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.2.1] - 2026-11-02
+
+### Fixed
+- `extractImageReferences()` no longer counts Markdown image syntax inside an HTML block (#11).
+  CommonMark doesn't parse Markdown in a `<table>`, `<pre>`, `<div>` or other HTML block, so
+  `![alt](path.png)` there is shown as text, but `validate()` reported it as a missing image.
+  `<img src>` inside an HTML block still counts, and so does `![…](…)` after the blank line that
+  ends the block. Inline tags within a paragraph, like `<code>![a](x.png)</code>`, still count too,
+  since that does render as an image. The same rule applies to `findOrphanedAssets()`.
+
 ## [2.2.0] - 2026-10-26
 
 ### Added

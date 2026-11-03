@@ -62,3 +62,39 @@ test('validation and orphan analysis ignore code but still report actual missing
   assert.deepEqual(analysis.orphanedAssetPaths, ['example.png']);
   assert.equal(analysis.unresolvedReferences.length, 1);
 });
+
+test('Markdown image syntax inside an HTML block is not an image (#11)', () => {
+  const extract = (markdown) => MdzArchiveCore.extractImageReferences(markdown);
+  // Ends at its closing tag, even on the same line (conditions 1-5).
+  assert.deepEqual(extract('<pre>![a](y.png)</pre>\n![real](real.png)'), ['real.png']);
+  assert.deepEqual(extract('<PRE class="x">\n![a](y.png)\n</pre>\n![real](real.png)'), ['real.png']);
+  assert.deepEqual(extract('<!-- ![a](c.png)\n![b](d.png) -->\n![real](real.png)'), ['real.png']);
+  assert.deepEqual(extract('<?php ![a](p.png) ?>\n![real](real.png)'), ['real.png']);
+  // Block-level tag (condition 6) and any complete tag alone on a line
+  // (condition 7): both end at a blank line.
+  assert.deepEqual(
+    extract('<table><tr><td><code>![a](z.png)</code></td></tr>\n<tr><td>![b](w.png)</td></tr></table>\n\n![real](real.png)'),
+    ['real.png']
+  );
+  assert.deepEqual(extract('<custom-box>\n![a](q.png)\n\n![real](real.png)'), ['real.png']);
+  // Markdown between blank lines inside a wrapper is parsed again.
+  assert.deepEqual(extract('<div align="right">\n\n![me](me.png)\n\n</div>'), ['me.png']);
+});
+
+test('<img src> inside an HTML block still counts (#11)', () => {
+  assert.deepEqual(
+    MdzArchiveCore.extractImageReferences('<table><tr><td><img src="cell.png"> ![a](z.png)</td></tr></table>'),
+    ['cell.png']
+  );
+  assert.deepEqual(MdzArchiveCore.extractImageReferences('<pre>\n<img src="pre.png">\n</pre>'), ['pre.png']);
+});
+
+test('inline tags in a paragraph do not start an HTML block (#11)', () => {
+  const extract = (markdown) => MdzArchiveCore.extractImageReferences(markdown);
+  assert.deepEqual(extract('<code>![a](x.png)</code>'), ['x.png']);
+  assert.deepEqual(extract('<span>text</span> ![a](x.png)'), ['x.png']);
+  // Condition 7 can't interrupt a paragraph.
+  assert.deepEqual(extract('Paragraph\n<custom-box>\n![a](x.png)'), ['x.png']);
+  // Indented four spaces is code, not HTML.
+  assert.deepEqual(extract('    <div>\n\n![a](x.png)'), ['x.png']);
+});

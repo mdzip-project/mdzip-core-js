@@ -709,6 +709,9 @@ test('findOrphanedAssets recognizes raw HTML <img> tag references', async () => 
   zip.file('docs/start.md', [
     '<img src="../assets/sized.png" width="200">',
     "<img src='../assets/single-quoted.png' />",
+    // A blank line ends the HTML block the <img> lines start; without it this
+    // line would be raw HTML text, not an image (#11).
+    '',
     '![md](../assets/markdown.png)'
   ].join('\n'));
   zip.file('assets/sized.png', new Uint8Array([1]));
